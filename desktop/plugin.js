@@ -722,10 +722,10 @@ function Legend({ geo, rv }) {
   }
   return jsxs('div', {
     'data-testid': 'legend',
-    style: { position: 'absolute', right: 8, top: 8, width: 150, fontSize: 10, color: 'var(--ui-text-tertiary)' },
+    style: { position: 'absolute', right: 10, top: 10, width: 'clamp(220px, 42%, 460px)', fontSize: 12, color: 'var(--ui-text-secondary)', background: 'rgba(255,255,255,0.78)', borderRadius: 6, padding: '4px 8px' },
     children: [
       jsx('div', { children: fd.label }),
-      jsx('div', { style: { height: 10, borderRadius: 3, background: `linear-gradient(90deg, ${parts.join(', ')})`, margin: '2px 0' } }),
+      jsx('div', { style: { height: 18, borderRadius: 4, background: `linear-gradient(90deg, ${parts.join(', ')})`, margin: '3px 0' } }),
       jsxs('div', { style: { display: 'flex', justifyContent: 'space-between' },
         children: [0, 0.25, 0.5, 0.75, 1].map(u => jsx('span', { children: fmt(lo + (hi - lo) * scaleInv(rv.scale || 'balanced', u)) }, u)) }),
       rv.hi != null && jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }, children: [
