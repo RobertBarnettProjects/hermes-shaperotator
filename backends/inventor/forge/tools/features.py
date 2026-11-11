@@ -755,6 +755,14 @@ def tube_frame(s: Session, members: list, od: float = 33.7, wall: float = 2.6, n
     wall: default wall thickness, mm (0 = solid rod; a short solid member makes a disc, e.g. a mounting tab)
     """
     ms = _tube_members(members, od, wall)
+    import os as _os
+    if _os.environ.get("INVENTOR_FORGE_SWEEP_FRAME") != "1":
+        try:
+            return _tube_frame_brep(s, ms, name)
+        except Exception as e:                          # fall back to the sweep method
+            brep_error = f"{type(e).__name__}: {e}"
+            for m in ms:
+                m.pop("ends", None)
     if not ms:
         raise InventorError("give at least one tube member")
     tx = s.app.TransactionManager.StartTransaction(s.doc(), name)
@@ -815,6 +823,8 @@ def tube_frame(s: Session, members: list, od: float = 33.7, wall: float = 2.6, n
         by_section = {}
         for c in cut:
             by_section[c["section"]] = r(by_section.get(c["section"], 0) + c["stock_mm"], 1)
+        if "brep_error" in locals():
+            out["brep_error"] = locals()["brep_error"]
         out.update(features=made, members=len(ms), cut_list=cut, stock_by_section_mm=by_section,
                    stock_length_convention="Untrimmed axial blank length of the constructed sweep, including corner run-ons. Tee blanks extend to the host centreline for coping. No saddle-depth deduction is applied.")
         tx.End()
@@ -822,3 +832,128 @@ def tube_frame(s: Session, members: list, od: float = 33.7, wall: float = 2.6, n
     except Exception:
         tx.Abort()
         raise
+
+
+def _unit(v):
+    n = math.sqrt(sum(c * c for c in v)) or 1.0
+    return [c / n for c in v]
+
+
+def _perp(n):
+    a = [1.0, 0.0, 0.0] if abs(n[0]) < 0.9 else [0.0, 1.0, 0.0]
+    x = _unit([a[1] * n[2] - a[2] * n[1], a[2] * n[0] - a[0] * n[2], a[0] * n[1] - a[1] * n[0]])
+    y = [n[1] * x[2] - n[2] * x[1], n[2] * x[0] - n[0] * x[2], n[0] * x[1] - n[1] * x[0]]
+    return x, y
+
+
+def _tube_frame_brep(s: Session, ms: list, name: str) -> dict:
+    """Exact welded CHS frame from transient B-rep: every member is a cylinder; two members meeting at a corner are
+    both mitred on the bisector plane; where three or more member ends meet, the tubes end at a welded node; a member
+    ending on another's side is coped into it (ends at its axis, inside the host). Outer solids are unioned, then the
+    bores (mitred the same way) are subtracted, so joints are clean with nothing crossing over."""
+    tb, tg = s.app.TransientBRep, s.tg
+    U, D, I = K.kBooleanTypeUnion, K.kBooleanTypeDifference, K.kBooleanTypeIntersect
+    L = 1e4                                            # cm: half-space block size
+    pt = lambda v: tg.CreatePoint(*[c * MM for c in v])
+
+    def half_space(p, n):
+        """Solid block {x : (x - p).n >= 0} (big), in cm."""
+        box = tg.CreateBox()
+        box.MinPoint = tg.CreatePoint(-L, -L, 0)
+        box.MaxPoint = tg.CreatePoint(L, L, L)
+        blk = tb.CreateSolidBlock(box)
+        x, y = _perp(n)
+        m = tg.CreateMatrix()
+        m.SetCoordinateSystem(pt(p), tg.CreateVector(*x), tg.CreateVector(*y), tg.CreateVector(*n))
+        tb.Transform(blk, m)
+        return blk
+
+    # ends: which members end at each node
+    key = lambda v: tuple(round(c, 2) for c in v)
+    ends = {}
+    for i, m in enumerate(ms):
+        ends.setdefault(key(m["a"]), []).append((i, "a"))
+        ends.setdefault(key(m["b"]), []).append((i, "b"))
+    plans = []                                          # per member: [start, end, trims]
+    nodes = []
+    for i, m in enumerate(ms):
+        a, b = list(m["a"]), list(m["b"])
+        u = _unit([b[k] - a[k] for k in range(3)])
+        trims, kinds = [], []
+        for side, P, out in (("a", a, [-c for c in u]), ("b", b, u)):
+            others = [(j, sd) for j, sd in ends[key(P)] if j != i]
+            kind = _end_kind(P, i, ms)
+            if kind == "corner" and len(others) == 1:
+                j, sd = others[0]
+                mj = ms[j]
+                q = mj["b"] if sd == "a" else mj["a"]
+                d_me = _unit([-c for c in out])         # from the node along me
+                d_ot = _unit([q[k] - P[k] for k in range(3)])
+                n = _unit([d_me[k] - d_ot[k] for k in range(3)])
+                ext = max(m["od"], mj["od"]) * 1.5
+                P2 = [P[k] + out[k] * ext for k in range(3)]
+                if side == "a":
+                    a = P2
+                else:
+                    b = P2
+                trims.append((P, n))
+                cosang = sum(d_me[k] * d_ot[k] for k in range(3))
+                kinds.append(f"mitre {round(math.degrees(math.acos(max(-1, min(1, cosang)))) / 2, 1)}°")
+            elif kind == "corner":                      # 3+ ends at one node: welded node
+                if key(P) not in [key(x[0]) for x in nodes]:
+                    nodes.append((P, max(ms[j]["od"] for j, _ in ends[key(P)]) / 2))
+                kinds.append("node")
+            else:
+                kinds.append(kind)
+        m["ends"] = kinds
+        plans.append((a, b, trims))
+
+    def member(i, radius):
+        a, b, trims = plans[i]
+        body = tb.CreateSolidCylinderCone(pt(a), pt(b), radius * MM, radius * MM, radius * MM)
+        for P, n in trims:
+            tb.DoBoolean(body, half_space(P, n), I)
+        return body
+
+    total = None
+    for i, m in enumerate(ms):
+        body = member(i, m["od"] / 2)
+        if total is None:
+            total = body
+        else:
+            tb.DoBoolean(total, body, U)
+    for P, rad in nodes:
+        tb.DoBoolean(total, tb.CreateSolidSphere(pt(P), rad * MM), U)
+    for i, m in enumerate(ms):
+        if m["wall"] > 0:
+            tb.DoBoolean(total, member(i, m["od"] / 2 - m["wall"]), D)
+
+    before = s.snapshot()
+    cd = s.cdef()
+    nbf = cd.Features.NonParametricBaseFeatures
+    try:
+        d = nbf.CreateDefinition()
+        col = s.to.CreateObjectCollection()
+        col.Add(total)
+        d.BRepEntities = col
+        d.OutputType = K.kSolidOutputType
+        feat = nbf.AddByDefinition(d)
+    except Exception:
+        feat = nbf.Add(total)
+    s.doc().Update()
+    out = s.delta(name, before)
+    cut = []
+    for i, m in enumerate(ms, 1):
+        L0 = math.dist(m["a"], m["b"])
+        cut.append({"member": i, "name": m["name"] or f"M{i}",
+                    "section": f"{m['od']:g}x{m['wall']:g} CHS" if m["wall"] > 0 else f"{m['od']:g} round bar",
+                    "length_mm": r(L0, 1), "ends": m["ends"],
+                    # long-point length: a mitred end runs on by r * tan(mitre angle) on the outside of the corner
+                    "stock_mm": r(L0 + sum(m["od"] / 2 * math.tan(math.radians(float(e.split()[1].rstrip("°"))))
+                                          for e in m["ends"] if e.startswith("mitre")), 1)})
+    by_section = {}
+    for c in cut:
+        by_section[c["section"]] = r(by_section.get(c["section"], 0) + c["stock_mm"], 1)
+    out.update(features=[safe(lambda: feat.Name, "Base")], members=len(ms), cut_list=cut, stock_by_section_mm=by_section,
+               joints="mitred corners, welded nodes where 3+ tubes meet, coped tees", method="brep")
+    return out
