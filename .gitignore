@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.FCStd1
+*.ipt
+*.iam
+*.ipj
+*.idw
+*.dwg
+_constants_cache.json

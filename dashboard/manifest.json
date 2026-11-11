@@ -1,0 +1,9 @@
+{
+  "name": "hermes-shaperotator",
+  "label": "ShapeRotator",
+  "description": "Backend routes for the hermes-shaperotator Desktop pane (3D view, face picking, FEA results, evidence).",
+  "icon": "Box",
+  "version": "0.1.0",
+  "tab": { "path": "/hermes-shaperotator", "hidden": true },
+  "api": "plugin_api.py"
+}

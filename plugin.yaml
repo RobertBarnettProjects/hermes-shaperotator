@@ -1,0 +1,61 @@
+name: hermes-shaperotator
+version: "0.1.0"
+manifest_version: 2
+api_version: 1
+requires_hermes: ">=0.22.7"
+license: MIT
+author: RobertBarnettProjects
+homepage: https://github.com/RobertBarnettProjects/hermes-shaperotator
+tags: [cad, engineering, freecad, inventor, drawings, fea, mechanical]
+description: >-
+  Verified engineering design: parametric CAD and linear-static FEA where every figure the agent
+  quotes is checked against the analyses it actually ran. One toolset drives FreeCAD (headless,
+  cross-platform) or Autodesk Inventor (Windows, COM); every feature reports a volume/topology delta;
+  FEA (FreeCAD FEM + CalculiX) reports equilibrium, mesh convergence and an AS/NZS-aware safety factor;
+  a design sweep finds the lightest part meeting a target; AS 1100 / ISO drawings with a QA gate on PDF
+  export; Desktop pane with a live 3D view, face picking, stress map and evidence log.
+provides_tools:
+  - cad_fea
+  - cad_status
+  - cad_backend
+  - cad_document
+  - cad_sketch
+  - cad_feature
+  - cad_inspect
+  - cad_parameters
+  - cad_drawing
+  - cad_transaction
+  - cad_python
+  - cad_native
+  - cad_plan
+  - cad_history
+  - cad_artifact
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - pre_llm_call
+  - transform_llm_output
+  - on_session_finalize
+python_dependencies:
+  - "pywin32>=306,<312; sys_platform == 'win32'"
+config_schema:
+  backend:
+    type: str
+    default: "freecad"
+    description: "Active CAD backend: freecad or inventor"
+  freecad_path:
+    type: str
+    default: ""
+    description: "Folder containing FreeCAD's bin directory (auto-detected when empty)"
+  standard:
+    type: str
+    default: "AS1100"
+    description: "Drawing standard: AS1100 (third angle) or ISO (first angle)"
+  job_dir:
+    type: str
+    default: ""
+    description: "Where models, previews and exports are written (default: plugin data dir)"
+  inventor_visible:
+    type: bool
+    default: true
+    description: "Show the Inventor window when the plugin starts Inventor"
