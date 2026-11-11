@@ -806,7 +806,6 @@ def _tag_parts(mesh, shape, source_path):
     try:
         Import.insert(source_path, d.Name)
         objs = [o for o in d.Objects if o.TypeId == "Part::Feature" and not o.Shape.isNull() and o.Shape.Solids]
-        names = [o.Label for o in objs]
         def signature(solid):
             bb = solid.BoundBox
             c = solid.CenterOfMass
@@ -814,7 +813,11 @@ def _tag_parts(mesh, shape, source_path):
                     bb.XMin, bb.YMin, bb.ZMin, bb.XMax, bb.YMax, bb.ZMax,
                     len(solid.Faces), len(solid.Edges)] + [coord for point in sorted(
                         (v.Point.x, v.Point.y, v.Point.z) for v in solid.Vertexes) for coord in point]
-        signatures = [signature(o.Shape) for o in objs]
+        names, signatures = [], []          # one entry per solid: a part can hold several bodies
+        for o in objs:
+            for so in o.Shape.Solids:
+                names.append(o.Label)
+                signatures.append(signature(so))
     finally:
         App.closeDocument(d.Name)
     matched = []
@@ -822,12 +825,28 @@ def _tag_parts(mesh, shape, source_path):
     for solid in sols:
         sig = signature(solid)
         candidates = [i for i, other in enumerate(signatures) if all(
-            abs(a - b) <= 1e-7 * max(1.0, abs(a), abs(b)) for a, b in zip(sig, other)) and len(sig) == len(other)]
+            abs(a - b) <= 1e-5 * max(1.0, abs(a), abs(b)) for a, b in zip(sig, other)) and len(sig) == len(other)]
         if len(candidates) != 1 or candidates[0] in used:
             matched = []
             break
         used.add(candidates[0])
         matched.append(names[candidates[0]])
+    if len(matched) != len(sols):          # fallback: nearest by volume + centre of mass (STEP readers differ slightly)
+        matched, used = [], set()
+        for solid in sols:
+            v, c = solid.Volume, solid.CenterOfMass
+            best, bd = None, None
+            for i, sg in enumerate(signatures):
+                if i in used or abs(sg[0] - v) > 1e-3 * max(1.0, v):
+                    continue
+                dist = ((sg[2] - c.x) ** 2 + (sg[3] - c.y) ** 2 + (sg[4] - c.z) ** 2) ** 0.5
+                if dist < 0.5 and (bd is None or dist < bd):
+                    best, bd = i, dist
+            if best is None:
+                matched = []
+                break
+            used.add(best)
+            matched.append(names[best])
     names = matched if len(matched) == len(sols) else [f"Body {i + 1}" for i in range(len(sols))]
     face_part = []
     for k, s in enumerate(sols):
