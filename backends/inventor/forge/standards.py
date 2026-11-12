@@ -65,7 +65,9 @@ STANDARDS: dict[str, dict] = {
     },
     "GB": {
         "name": "Chinese (GB/T)", "region": "China",
-        "drawing": "GB/T 4457, GB/T 14689, GB/T 14692", "projection": "first", "template": "GB.idw",
+        "drawing": "GB/T 4457, GB/T 14689, GB/T 14692", "projection": "first", "template": "ISO.idw",
+        # Inventor's GB.idw puts view labels above the views, which the automatic layout doesn't handle yet
+        "note": "sheet from Inventor's ISO template (first angle); Inventor's GB title block isn't used yet",
         "decimal": "point", "trailing_zeros": False, "sheets": ["A0", "A1", "A2", "A3", "A4"],
         "general_tolerance": "GB/T 1804-m", "threads": "ISO metric coarse (GB/T 193)",
         "fasteners": "GB/T 5783 bolts, GB/T 6170 nuts (built to the ISO-equivalent sizes)",

@@ -283,7 +283,13 @@ def _copy(s: Session, pid: int, source: str, new_name: str) -> dict:
         _rename(s, pid, copy, new_name)
         copy = new_name
     after = _settled_sa(s)
-    return {"study": copy, "parameters": _inserted(before_params, after), "duplicates": duplicates}
+    try:
+        params = _inserted(before_params, after)
+    except InventorError:
+        for n in [copy, *duplicates]:          # don't leave a copy whose loads can't be identified
+            safe(lambda n=n: delete_study_item(s, n))
+        raise
+    return {"study": copy, "parameters": params, "duplicates": duplicates}
 
 
 def _sets(names: list[str], size: int, what: str) -> list[list[str]]:
@@ -306,13 +312,13 @@ def _write_checked(s: Session, sets: list[list[str]], values: list) -> list[dict
     first = [p[n].Expression for n in sets[0]]
     for other in sets[1:]:
         shown = [p[n].Expression for n in other]
-        if not all(U.same_value(a, b) for a, b in zip(shown, first)):
+        if not all(_same_param(a, b) for a, b in zip(shown, first)):
             raise InventorError(f"the copy holds parameter sets that disagree ({first} vs {shown}); nothing was written")
     for names in sets:
         _write(s, {n: v for n, v in zip(names, values) if v is not None})
     p = _sa_params(s)
     bad = [{"parameter": n, "wanted": v, "shown": p[n].Expression}
-           for names in sets for n, v in zip(names, values) if v is not None and not U.same_value(p[n].Expression, str(v))]
+           for names in sets for n, v in zip(names, values) if v is not None and not _same_param(p[n].Expression, str(v))]
     if bad:
         raise InventorError(f"Inventor did not keep the load values written: {bad}")
     return [_param_row(p[n]) for n in sets[-1]]

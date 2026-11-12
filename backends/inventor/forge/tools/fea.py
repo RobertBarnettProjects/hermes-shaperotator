@@ -126,8 +126,11 @@ def _set_value(dlg: int, c: U.Ctrl, text: str, pid: int, allow_typing: bool = Tr
     """Enter a value and confirm the box took it. Done with window messages and a real focus change (typed
     keys are sometimes dropped); typing is only the fallback, and only where the user agreed to it."""
     _front(dlg)
+    # move focus to the Cancel button (focus only, never pressed), not to another value box: a box that has focus
+    # shows its raw text, so focusing the next box left the previous one looking uncommitted ("12.5" vs "12.500 N")
+    cancel = safe(lambda: U.find(dlg, cid=2))
     others = [o for o in U.find_all(dlg, cls="Edit") if o.hwnd != c.hwnd and o.enabled]
-    other = others[0] if others else U.find(dlg, cid=2)
+    other = cancel if cancel is not None and getattr(cancel, "enabled", True) else (others[0] if others else cancel)
     shown = U.commit_text(c, text, other)
     if U.same_value(shown, text) and shown.strip() == str(text).strip() and _leading(text):
         # shown exactly as entered: Inventor reformats a value it has parsed (12.5 -> 12.500 N), so this one may

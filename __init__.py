@@ -92,8 +92,9 @@ def _pre_tool_call(tool_name: str = "", args: Any = None, **kw: Any):
     LIVE.enter()
     out = _pre_tool_call_inner(tool_name, args, **kw)
     if outside and (out is None or out.get("action") == "approve"):
-        note = (f"hermes-shaperotator wants {tool_name} to write outside its job folder ({STATE.jobs()}):" + NL * 2
-                + NL.join(outside) + NL * 2 + "Approve only if you asked for the file to go there.")
+        note = (f"hermes-shaperotator wants {tool_name} to use these locations outside its job folder "
+                f"({STATE.jobs()}), possibly writing to them:" + NL * 2
+                + NL.join(outside) + NL * 2 + "Approve only if you asked for that.")
         out = {"action": "approve", "message": note + (NL * 2 + out["message"] if out else "")}
     return out
 

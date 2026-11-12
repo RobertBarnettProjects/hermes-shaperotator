@@ -537,7 +537,11 @@ def transaction(s: Session, action: str = "begin", name: str = "forge") -> dict:
 def undo(s: Session, steps: int = 1) -> dict:
     """Undo the last N operations in the working document."""
     before = s.snapshot()
-    s.front()                          # TransactionManager undoes in whatever document is active: make it ours
+    cur = s.front()                    # TransactionManager undoes in whatever document is active: make it ours
+    act = s.app.ActiveDocument
+    if act is None or s.key(act) != s.key(cur):
+        raise InventorError("couldn't make the working document active, so undo would act on another document; "
+                            "nothing was undone")
     tm = s.app.TransactionManager
     done = 0
     for _ in range(max(1, int(steps))):

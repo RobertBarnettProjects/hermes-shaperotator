@@ -146,7 +146,8 @@ def create_drawing(s: Session, standard: str = "", sheet_size: str = "A3", orien
             **({"prompts_cancelled": prompts} if prompts else {}),
             **({"warning": f"Inventor's {want} template isn't installed; used {os.path.basename(tpl) or 'the default'} "
                            "with the standard's projection and dimension style"}
-               if os.path.basename(tpl or "") != want else {})}
+               if os.path.basename(tpl or "") != want else {}),
+            **({"note": spec["note"]} if spec.get("note") else {})}
 
 
 def _third(standard: str) -> bool:

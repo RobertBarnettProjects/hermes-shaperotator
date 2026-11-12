@@ -185,3 +185,30 @@ def test_nested_and_listed_paths_are_checked(job, tmp_path):
                  {"jobs": [{"out": "~/x"}]}):
         out = P._pre_tool_call(tool_name="cad_native", args={"tool": "batch_export", "args": args})
         assert out and out["action"] == "approve", args
+
+
+def test_free_text_is_not_a_path(job):
+    for args in ({"notes": ["A: all dimensions in mm", "/ 2 places"]}, {"fields": {"title": "C: bracket"}},
+                 {"comment": "Cost $5 each"}, {"mass_note": "~3 kg"}, {"alloy": "100%Fe%"}, {"profile": "50x50x3 SHS"}):
+        assert P._pre_tool_call(tool_name="cad_native", args={"tool": "any_tool", "args": args}) is None, args
+
+
+def test_climbing_and_uri_arguments_prompt(job):
+    for args in ({"out": "../../../x.step"}, {"location": "sub/../../../x"}, {"uri": "file:///C:/Users/x/.ssh/k"}):
+        out = P._pre_tool_call(tool_name="cad_native", args={"tool": "export", "args": args})
+        assert out and out["action"] in ("approve", "block"), args
+
+
+def test_named_close_and_in_place_savers_prompt(job, monkeypatch):
+    monkeypatch.setattr(paths, "open_document_path", lambda: paths.UNKNOWN)
+    for args in ({"tool": "close_document", "args": {"name": "customer.ipt", "save": True}},
+                 {"tool": "run_study_cases", "args": {"template": "S", "cases": []}},
+                 {"tool": "save_document", "args": {}}):
+        out = P._pre_tool_call(tool_name="cad_native", args=args)
+        assert out and out["action"] == "approve", args
+
+
+def test_path_words(job):
+    assert paths.path_named("filePath") and paths.path_named("csv_path") and paths.path_named("outputDir")
+    assert paths.path_named("export.saveAs") and paths.path_named("files[0]")
+    assert not paths.path_named("profile") and not paths.path_named("material")

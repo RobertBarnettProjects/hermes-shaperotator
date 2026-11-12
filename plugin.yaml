@@ -12,9 +12,10 @@ description: >-
   quotes is checked against the analyses it actually ran. One toolset drives FreeCAD (headless,
   cross-platform) or Autodesk Inventor (Windows, COM); every feature reports a volume/topology delta;
   FEA (FreeCAD FEM + CalculiX) reports equilibrium, mesh convergence and an AS/NZS-aware safety factor;
-  a design sweep finds the lightest part meeting a target; AS 1100 / ISO drawings with a QA gate on PDF
-  export; Desktop pane with a live 3D view, face picking, stress map and evidence log.
+  a design sweep finds the lightest part meeting a target; drawings to the standard the user picks once per chat
+  (AS 1100, ISO, ASME, DIN, BS 8888, JIS, GB) with a QA gate on PDF export; Desktop pane with a live 3D view, face picking, stress map and evidence log.
 provides_tools:
+  - cad_standard
   - cad_fea
   - cad_status
   - cad_backend
@@ -49,8 +50,8 @@ config_schema:
     description: "Folder containing FreeCAD's bin directory (auto-detected when empty)"
   standard:
     type: str
-    default: "AS1100"
-    description: "Drawing standard: AS1100 (third angle) or ISO (first angle)"
+    default: ""
+    description: "Fix one standard for every chat (AS1100, ISO, ASME, DIN, BS8888, JIS or GB). Empty: the agent asks once per chat"
   job_dir:
     type: str
     default: ""

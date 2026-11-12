@@ -241,7 +241,8 @@ def cad_drawing(args: dict, **_: Any) -> str:
         std = _std.for_call(g("standard") or "")
         if not std:
             return _err(_std.ASK)
-        units = (_std.chosen() or {}).get("drawing_units", "mm") if not g("standard") else "mm"
+        mine = _std.chosen() or {}
+        units = mine.get("drawing_units", "mm") if mine.get("standard") == std else "mm"
         if units == "in" and STATE.family == "freecad":
             return _err("inch drawings need the Inventor backend (FreeCAD sheets are metric); use mm or cad_backend inventor")
         extra = {"drawing_units": units} if STATE.family in ("inventor", "freecad") else {}
@@ -566,8 +567,9 @@ def cad_native(args: dict, **_: Any) -> str:
         if isinstance(targs.get(key), str) and targs[key]:
             targs[key] = _paths.safe_name(targs[key])        # these become file names inside Inventor's workdir
     for key, value in _paths.written_args("cad_native", {"tool": tool, "args": targs}):
-        if key in targs and _paths.PATH_KEY.search(key):   # top-level path arguments are resolved, so the server gets a real path
-            targs[key] = str(_paths.resolve(value))  # outside the job folders only after the user approved it
+        if _paths.path_named(key) and not _paths.expands(value) and not value.strip().lower().startswith("file:"):
+            # path arguments (nested ones too) are resolved here, so the server gets the same path the hook checked
+            _paths.set_nested(targs, key, str(_paths.resolve(value)))   # outside the job folder only once approved
     r = _call("native", tool=tool, args=targs)
     if tool == "analyze_stress":
         r = _native_fea_evidence(targs, r)
