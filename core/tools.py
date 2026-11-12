@@ -275,7 +275,8 @@ def cad_drawing(args: dict, **_: Any) -> str:
         extra = ({"standard": std, "drawing_units": (_std.chosen() or {}).get("drawing_units", "mm")}
                  if STATE.family == "inventor" else {})
         r = _call(f"drawing_{a}", model_path=_path(args["model_path"], ""), views=g("views", "front,top,right,iso"), **extra,
-                  scale=g("scale", 0), sheet_size=g("sheet_size", "A3"), up=g("up", "z"),
+                  scale=g("scale", 0), sheet_size=g("sheet_size", "auto" if a == "assembly_sheet" else "A3"),
+                  up=g("up", "auto" if a == "assembly_sheet" else "z"),
                   new_sheet=bool(g("new_sheet", False)))
     elif a == "check":
         r = _call("drawing_check")

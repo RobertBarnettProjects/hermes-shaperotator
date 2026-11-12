@@ -110,6 +110,13 @@ def extract(text: str) -> list[Claim]:
 def check(text: str, records: list[Record] | None = None) -> list[Claim]:
     records = EVIDENCE.items() if records is None else records
     claims = extract(text)
+    yields = [r for r in records if "yield_MPa" in r.values]
+    kept = []
+    for c in claims:
+        if c.quantity == "stress_MPa" and YIELD_NEAR.search(c.ctx) and not yields:
+            continue                       # "C250L0 (yield 250 MPa)" describes the material, not a computed stress
+        kept.append(c)
+    claims[:] = kept
     for c in claims:
         keys = BACKING[c.quantity]
         if c.quantity == "stress_MPa" and YIELD_NEAR.search(c.ctx):

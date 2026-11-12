@@ -61,7 +61,11 @@ def safe_name(name: str, default: str = "file", limit: int = 80) -> str:
 NATIVE_READS = {
     "open_document": {"path"}, "place_component": {"path"}, "read_stress_report": {"path"},
     "read_pdf_text": {"path"}, "set_active_project": {"project"}, "create_drawing": {"model_path"},
-    "add_base_view": {"model_path", "path"}, "make_part_sheet": {"model_path"}, "make_assembly_sheet": {"model_path"},
+    "add_base_view": {"model_path", "path", "model"}, "make_part_sheet": {"model_path", "model"},
+    "make_assembly_sheet": {"model_path", "model"},
+    # these name an open document or a file they only read
+    "activate_document": {"name", "path"}, "close_document": {"name"}, "copy_parameters": {"source"},
+    "link_parameters": {"source"}, "derive_part": {"source", "path"}, "insert_derived": {"source", "path"},
 }
 # words that make an argument a file location when they end its name: csv_path, filePath, outputDir, dest, saveAs
 PATH_WORDS = {"path", "paths", "file", "files", "filename", "filenames", "folder", "dir", "directory", "output", "outputs",

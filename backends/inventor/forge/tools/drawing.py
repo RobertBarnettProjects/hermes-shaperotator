@@ -128,7 +128,7 @@ def create_drawing(s: Session, standard: str = "", sheet_size: str = "A3", orien
         if True:                                      # every standard: no trailing zeros (metric), inline diameters
             od = safe(lambda: std.ActiveObjectDefaults)
             for attr in ("LinearDimensionStyle", "DiameterDimensionStyle", "RadialDimensionStyle",
-                         "BaselineDimensionStyle"):
+                         "BaselineDimensionStyle", "HoleNoteStyle", "ThreadNoteStyle"):   # notes read horizontally too
                 ds = safe(lambda a=attr: getattr(od, a)) if od is not None else None
                 if ds is not None:
                     if marker is not None:
@@ -555,15 +555,25 @@ def add_parts_list(s: Session, view: str = "", x: float = 0.0, y: float = 0.0) -
             "size_mm": [r(width, 1), r(height, 1)]}
 
 
+def _ballooned_items(sh) -> set:
+    out = set()
+    for bl in items(sh.Balloons):
+        for vs in items(safe(lambda bl=bl: bl.BalloonValueSets)):
+            out.add(str(safe(lambda vs=vs: vs.ItemNumber, "")))
+    return out
+
+
 @tool("drawing")
 def auto_balloon(s: Session, view: str = "") -> dict:
     """Balloon every component visible in an assembly view, placed outside the view and linked to
-    the parts list numbering."""
+    the parts list numbering. Items that already have a balloon on the sheet (from another view) are skipped,
+    so a second call on another view only adds the missing ones."""
     sh = _sheet(s)
     if view:
         v = _view(s, view)
     else:       # an orthographic view shows outlines best
-        vs = [w for w in items(sh.DrawingViews) if "Iso" not in K.name_of(safe(lambda w=w: w.Camera.ViewOrientationType, 0), "k")]
+        vs = [w for w in items(sh.DrawingViews) if "Iso" not in K.name_of(safe(lambda w=w: w.Camera.ViewOrientationType, 0), "k")
+              and not str(safe(lambda w=w: w.Name, "")).upper().startswith("ISO")]       # nor a camera-aimed iso
         v = vs[-1] if vs else sh.DrawingViews.Item(1)
     md = v.ReferencedDocumentDescriptor.ReferencedDocument
     if s.kind(md) != "assembly":
@@ -571,6 +581,8 @@ def auto_balloon(s: Session, view: str = "") -> dict:
     l, b, rgt, t = _box(v)
     cx, cy = (l + rgt) / 2, (b + t) / 2
     placed, done, taken = 0, set(), []
+    already = _ballooned_items(sh)
+    taken += [((bb.Position.X * 10), (bb.Position.Y * 10)) for bb in items(sh.Balloons) if safe(lambda bb=bb: bb.Position)]
     for occ in items(md.ComponentDefinition.Occurrences):
         fname = safe(lambda o=occ: o.Definition.Document.FullFileName, occ.Name)
         if fname in done:
@@ -616,9 +628,15 @@ def auto_balloon(s: Session, view: str = "") -> dict:
         if bx is None:
             bx, by = cx + dx / n * rad, cy + dy / n * rad
         pts = s.collection([s.tg.CreatePoint2d(bx * MM, by * MM), sh.CreateGeometryIntent(c)])
-        if safe(lambda: sh.Balloons.Add(pts), None) is not None:
-            placed += 1
+        bal = safe(lambda: sh.Balloons.Add(pts), None)
+        if bal is not None:
             done.add(fname)
+            nums = {str(safe(lambda vs=vs: vs.ItemNumber, "")) for vs in items(safe(lambda: bal.BalloonValueSets))}
+            if nums and nums <= already:               # this item is ballooned elsewhere on the sheet
+                safe(lambda: bal.Delete())
+                continue
+            already |= nums
+            placed += 1
             taken.append((bx, by))
     return {"balloons": placed, "view": v.Name}
 
@@ -717,7 +735,8 @@ def _best_base(md, L: list[float]) -> str:
 
 def _base_sizes(L: list[float], base: str, rotate: bool) -> tuple:
     """(width, height, depth) of the main view on the sheet, before scaling."""
-    fw, fh, dp = {"front": (L[0], L[1], L[2]), "top": (L[0], L[2], L[1]), "right": (L[2], L[1], L[0])}[base]
+    fw, fh, dp = {"front": (L[0], L[1], L[2]), "top": (L[0], L[2], L[1]), "bottom": (L[0], L[2], L[1]),
+                  "right": (L[2], L[1], L[0])}[base]
     return (fh, fw, dp) if rotate else (fw, fh, dp)
 
 
@@ -769,12 +788,27 @@ def _layout(s: Session, md, want: list[str], third: bool, scale: float, label_ga
         diag = math.sqrt(L[0] ** 2 + L[1] ** 2 + L[2] ** 2) or 1
         iso_sc = _pick_scale(diag, diag * 0.85, iso_w - 10, iso_h - label_gap)
         iso_sc = min(iso_sc, sc)
-        v = sh.DrawingViews.AddBaseView(md, s.tg.CreatePoint2d((iso_x0 + iso_w / 2) * MM,
-                                                               (g["y1"] - iso_h / 2) * MM), iso_sc,
-                                        K.kIsoTopRightViewOrientation, K.kShadedDrawingViewStyle)
+        at = s.tg.CreatePoint2d((iso_x0 + iso_w / 2) * MM, (g["y1"] - iso_h / 2) * MM)
+        v = None
+        if base == "bottom":             # a Z-up model: Inventor's iso orientations assume Y up, so aim a camera
+            v = safe(lambda: _z_up_iso(s, sh, md, at, iso_sc))
+        if v is None:
+            v = sh.DrawingViews.AddBaseView(md, at, iso_sc, K.kIsoTopRightViewOrientation, K.kShadedDrawingViewStyle)
         v.Name = "ISOMETRIC"
         made.append(_view_row(v))
     return {"scale": sc, "views": made}
+
+
+def _z_up_iso(s: Session, sh, md, at, scale):
+    """Shaded isometric of a Z-up model, seen from front-right and above with Z up the sheet."""
+    rb = md.ComponentDefinition.RangeBox
+    c = [(rb.MinPoint.X + rb.MaxPoint.X) / 2, (rb.MinPoint.Y + rb.MaxPoint.Y) / 2, (rb.MinPoint.Z + rb.MaxPoint.Z) / 2]
+    cam = s.app.TransientObjects.CreateCamera()
+    cam.Target = s.tg.CreatePoint(*c)
+    cam.Eye = s.tg.CreatePoint(c[0] + 1000, c[1] - 1000, c[2] + 800)
+    cam.UpVector = s.tg.CreateUnitVector(0, 0, 1)
+    return sh.DrawingViews.AddBaseView(md, at, scale, K.kArbitraryViewOrientation, K.kShadedDrawingViewStyle,
+                                       "", cam)
 
 
 def _hole_position_dims(s: Session, view_name: str) -> int:
@@ -975,7 +1009,7 @@ def _note_score(sh, box, own=None) -> float:
     return score
 
 
-def _place_note(s: Session, sh, make, anchor_cm, view_box) -> object:
+def _place_note(s: Session, sh, make, anchor_cm, view_box, level: float = 0.0, with_score: bool = False):
     """Create a note with `make(point)` at the best of a ring of candidate spots around its anchor; keeps the first spot
     if it is already clear. Leader notes ignore later moves, so each candidate is a fresh note."""
     best = None
@@ -993,7 +1027,10 @@ def _place_note(s: Session, sh, make, anchor_cm, view_box) -> object:
         rb = safe(lambda: note.Text.RangeBox)
         if rb is None:
             return note
-        sc = _note_score(sh, _mm_box(rb), own=note) + math.hypot(x - ax, y - ay) * 0.06
+        clash = _note_score(sh, _mm_box(rb), own=note)
+        sc = clash + math.hypot(x - ax, y - ay) * 0.06
+        if level:            # hole notes' text runs along the leader: among clear spots, prefer a level leader
+            sc += level * abs(y - ay) / max(math.hypot(x - ax, y - ay), 1e-6) if clash < 5 else 1000
         if best is None or sc < best[0]:
             if best is not None:
                 safe(lambda b=best[1]: b.Delete())
@@ -1002,6 +1039,8 @@ def _place_note(s: Session, sh, make, anchor_cm, view_box) -> object:
             safe(lambda: note.Delete())
         if i == 0 and sc < 5:                        # the usual spot is clear
             break
+    if with_score:
+        return (best[1], best[0]) if best else (None, None)
     return best[1] if best else None
 
 
@@ -1059,38 +1098,50 @@ def _round_callouts(s: Session, view_name: str) -> dict:
         free = [m for m in members if all(abs(m[0][1] - y_) > 0.8 for y_ in used_rows)] or members
         (cx0, cy0), c = max(free, key=lambda m: m[0][0])
         used_rows.append(cy0)
-        note = _place_note(s, sh, lambda tp, c=c: sh.DrawingNotes.HoleThreadNotes.Add(tp, c), (cx0, cy0), b)
-        if note is None:
-            continue
-        groups += 1
         n = len(members)
         md_ = safe(lambda: v.ReferencedDocumentDescriptor.ReferencedDocument)
         tmap = _thread_map(md_) if md_ is not None else {}
         thr = next((tmap[k] for k in (safe(lambda f=f: (safe(lambda: f.NativeObject) or f).TransientKey) for f in _curve_faces(c))
                     if k in tmap), None)
-        if thr:                                        # a cosmetic thread: call out the thread, not the drill size
-            text = note.FormattedHoleThreadNote
-            size = (re.search(r"FontSize='([0-9.]+)'", text) or [None, "0.35"])[1]
-            tail = " THRU" if "THRU" in text.upper() else ""
-            safe(lambda: setattr(note, "FormattedHoleThreadNote",
-                                 f"<StyleOverride Font='Tahoma' FontSize='{size}'>{(str(n) + '× ') if n > 1 else ''}{thr}{tail}</StyleOverride>"))
-            continue
         radii = [math.hypot(cx - vc[0], cy - vc[1]) for (cx, cy), _ in members]
         pcd = ""
         if n >= 3 and max(radii) - min(radii) < 0.01:
             pcd = f" ON Ø{round(radii[0] * 20 / v.Scale, 2):g} PCD"
-        if n > 1 or pcd:
+
+        def finish(note, n=n, thr=thr, pcd=pcd):
+            """The note's final text (count, thread, PCD), set before its position is scored: a note placed with
+            Inventor's short default text and lengthened afterwards ran across the neighbouring view."""
             text = note.FormattedHoleThreadNote
             size = (re.search(r"FontSize='([0-9.]+)'", text) or [None, "0.35"])[1]
             wrap = lambda x: f"<StyleOverride Font='Tahoma' FontSize='{size}'>{x}</StyleOverride>"
-            head, sep, rest = text.partition("<Br/>")          # the PCD belongs with the hole size, on line 1
-            prefix = wrap(f"{n}× ") if n > 1 else ""
-            safe(lambda: setattr(note, "FormattedHoleThreadNote", prefix + head + (wrap(pcd) if pcd else "") + sep + rest))
-        tb = safe(lambda: note.Text.RangeBox)              # the text is centred on the leader end: move it clear
-        if tb is not None and tb.MinPoint.X * 10 < b[2] + 5:
-            dx = (b[2] + 5) * MM - tb.MinPoint.X
-            o = note.Text.Origin
-            safe(lambda: setattr(note.Text, "Origin", s.tg.CreatePoint2d(o.X + dx, o.Y)))
+            if thr:                                    # a cosmetic thread: call out the thread, not the drill size
+                tail = " THRU" if "THRU" in text.upper() else ""
+                safe(lambda: setattr(note, "FormattedHoleThreadNote", wrap(f"{(str(n) + '× ') if n > 1 else ''}{thr}{tail}")))
+            elif n > 1 or pcd:
+                head, sep, rest = text.partition("<Br/>")          # the PCD belongs with the hole size, on line 1
+                prefix = wrap(f"{n}× ") if n > 1 else ""
+                safe(lambda: setattr(note, "FormattedHoleThreadNote", prefix + head + (wrap(pcd) if pcd else "") + sep + rest))
+            return note
+
+        # try the note from each hole of the group (outermost first) and keep the clearest, most level placement
+        note, best_sc = None, None
+        order = sorted(free, key=lambda m: -abs(m[0][0] - vc[0]))[:6]
+        for (hx, hy), hc in order:
+            cand, sc = _place_note(s, sh, lambda tp, hc=hc, finish=finish: finish(sh.DrawingNotes.HoleThreadNotes.Add(tp, hc)),
+                                   (hx, hy), b, level=40.0, with_score=True)
+            if cand is None:
+                continue
+            if note is None or sc < best_sc:
+                if note is not None:
+                    safe(lambda n_=note: n_.Delete())
+                note, best_sc = cand, sc
+            else:
+                safe(lambda c_=cand: c_.Delete())
+            if best_sc < 3:
+                break
+        if note is None:
+            continue
+        groups += 1
     # cosmetic threads that aren't hole features, and holes that show as splines: leader notes
     md = safe(lambda: v.ReferencedDocumentDescriptor.ReferencedDocument)
     threads = _thread_map(md) if md is not None else {}
@@ -1466,11 +1517,13 @@ def _ga_sheet_size(s: Session, md, rows: int) -> str:
 @tool("drawing")
 def make_assembly_sheet(s: Session, model: str = "", scale: float = 0.0, sheet_size: str = "A3",
                         standard: str = "", title: str = "", drawing_number: str = "",
-                        drawn_by: str = "") -> dict:
+                        drawn_by: str = "", up: str = "auto") -> dict:
     """One-shot general-arrangement (GA) drawing of an assembly: FRONT + TOP, shaded ISOMETRIC, parts
     list above the title block, balloons, labels, title block, QA.
 
     sheet_size: A3, A2, A1 or auto (the smallest sheet that reaches the largest standard scale)
+    up: the model's up axis: y (Inventor's default), z (vehicles, frames, anything modelled on the XY ground
+      plane), or auto (z when the model is flattest along Z)
     """
     md = _model_doc(s, model)
     if s.kind(md) != "assembly":
@@ -1480,7 +1533,13 @@ def make_assembly_sheet(s: Session, model: str = "", scale: float = 0.0, sheet_s
     if sheet_size.lower() == "auto":
         sheet_size = _ga_sheet_size(s, md, safe(lambda: md.ComponentDefinition.Occurrences.Count, 0))
     create_drawing(s, standard=standard, sheet_size=sheet_size)
-    lay = _layout(s, md, ["front", "top", "iso"], third, scale)
+    L = _extents(md)
+    u = (up or "auto").lower()
+    if u == "auto":
+        u = "z" if L[2] < min(L[0], L[1]) else "y"      # flattest along Z: modelled on the XY ground plane
+    # Z up: the elevation (looking along Y) is the FRONT view and the plan (looking down Z) the TOP
+    # Inventor's Bottom orientation looks along +Y with Z up the sheet: the elevation of a Z-up model
+    lay = _layout(s, md, ["front", "top", "iso"], third, scale, base="bottom" if u == "z" else "front")
     pl = add_parts_list(s, "FRONT")
     # if the iso view now collides with the parts list, shrink it toward the top-right
     sh = _sheet(s)
@@ -1495,12 +1554,17 @@ def make_assembly_sheet(s: Session, model: str = "", scale: float = 0.0, sheet_s
             iso.Position = s.tg.CreatePoint2d((g["x1"] - (b[2] - b[0]) / 2 - 2) * MM,
                                               (g["y1"] - (b[3] - b[1]) / 2 - 2) * MM)
     bl = auto_balloon(s)
+    # parts hidden in that view (rims inside tyres in a plan) get their balloon on the other orthographic view
+    for other in ("FRONT", "TOP"):
+        if other != bl.get("view") and any(o.Name == other for o in items(sh.DrawingViews)):
+            extra = safe(lambda o=other: auto_balloon(s, view=o), {"balloons": 0})
+            bl["balloons"] = bl.get("balloons", 0) + extra.get("balloons", 0)
     place_view_labels(s)
     set_title_block_field(s, {k: v for k, v in (("title", title or md.DisplayName.split(".")[0].upper()),
                                                 ("drawing_number", drawing_number), ("drawn_by", drawn_by)) if v})
     if third:
         safe(lambda: add_projection_symbol(s))
-    return {"scale": _scale_text(lay["scale"]), "sheet": sheet_size, "parts_list_rows": pl["rows"], "balloons": bl["balloons"],
+    return {"scale": _scale_text(lay["scale"]), "sheet": sheet_size, "up": u, "parts_list_rows": pl["rows"], "balloons": bl["balloons"],
             "qa": check_drawing(s)}
 
 

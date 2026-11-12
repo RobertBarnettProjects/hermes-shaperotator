@@ -230,10 +230,76 @@ def _aim_point(s: Session, face, n) -> list[float]:
     fallback = [p.X, p.Y, p.Z]
     if face.SurfaceType != K.kPlaneSurface:
         return fallback
+    key = safe(lambda: face.TransientKey)
     q = [v * 0.1 for v in face_centroid(face)]
-    if _ray_first_hit_is(s, face, [q[i] + n[i] * 100 for i in range(3)], [-n[0], -n[1], -n[2]]):
-        return q
+    span = _face_span(face)
+    # the click is checked by colour samples around it (OFFSETS, up to ~0.135 of the view): the view is later
+    # sized so those samples sit on a circle of radius `ring` that is known to be on the face
+    for frac in (0.12, 0.08, 0.05, 0.03):
+        ring = frac * span
+        if _on_face(s, face, n, q) and _interior_score(s, face, n, q, ring) == 8:
+            _RING[key] = ring
+            return q
+        # the centroid of a ring or a plate with holes is often off the face (in the bore): search the face
+        best = _interior_point(s, face, n, fallback, ring)
+        if best is not None:
+            _RING[key] = ring
+            return best
     return fallback
+
+
+_RING: dict = {}            # face TransientKey -> radius (cm) around the aim point that is all on the face
+SAMPLE_REACH = 0.135        # farthest colour sample from the view centre, as a fraction of the view's height
+
+
+def _plane_basis(n):
+    a = (1.0, 0.0, 0.0) if abs(n[0]) < 0.9 else (0.0, 1.0, 0.0)
+    u = [n[1] * a[2] - n[2] * a[1], n[2] * a[0] - n[0] * a[2], n[0] * a[1] - n[1] * a[0]]
+    lu = math.sqrt(sum(v * v for v in u))
+    u = [v / lu for v in u]
+    v = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]]
+    return u, v
+
+
+def _face_span(face) -> float:
+    rb = face.Evaluator.RangeBox
+    span = sorted([rb.MaxPoint.X - rb.MinPoint.X, rb.MaxPoint.Y - rb.MinPoint.Y, rb.MaxPoint.Z - rb.MinPoint.Z])
+    return max(span[1], 0.05)
+
+
+def _on_face(s: Session, face, n, q) -> bool:
+    return bool(_ray_first_hit_is(s, face, [q[i] + n[i] * 100 for i in range(3)], [-n[0], -n[1], -n[2]]))
+
+
+def _interior_score(s: Session, face, n, q, ring: float | None = None) -> int:
+    """How many of 8 points on a small circle around q (in the face's plane) are on the face."""
+    u, v = _plane_basis(n)
+    r = ring if ring is not None else 0.12 * _face_span(face)
+    hits = 0
+    for k in range(8):
+        a = k * math.pi / 4
+        pt = [q[i] + r * (math.cos(a) * u[i] + math.sin(a) * v[i]) for i in range(3)]
+        hits += _on_face(s, face, n, pt)
+    return hits
+
+
+def _interior_point(s: Session, face, n, on_plane, ring: float) -> list[float] | None:
+    """A grid point on the face with the whole circle of radius `ring` around it on the face (cm), or None."""
+    u, v = _plane_basis(n)
+    rb = face.Evaluator.RangeBox
+    corners = [(x, y, z) for x in (rb.MinPoint.X, rb.MaxPoint.X) for y in (rb.MinPoint.Y, rb.MaxPoint.Y)
+               for z in (rb.MinPoint.Z, rb.MaxPoint.Z)]
+    pu = [sum((c[i] - on_plane[i]) * u[i] for i in range(3)) for c in corners]
+    pv = [sum((c[i] - on_plane[i]) * v[i] for i in range(3)) for c in corners]
+    steps = 8
+    for a in range(1, steps):
+        for b in range(1, steps):
+            su = min(pu) + (max(pu) - min(pu)) * a / steps
+            sv = min(pv) + (max(pv) - min(pv)) * b / steps
+            q = [on_plane[i] + su * u[i] + sv * v[i] for i in range(3)]
+            if _on_face(s, face, n, q) and _interior_score(s, face, n, q, ring) == 8:
+                return q
+    return None
 
 
 def _look_at_face(s: Session, face, at=None) -> None:
@@ -269,6 +335,9 @@ def _look_at_face(s: Session, face, at=None) -> None:
     span = sorted([rb.MaxPoint.X - rb.MinPoint.X, rb.MaxPoint.Y - rb.MinPoint.Y, rb.MaxPoint.Z - rb.MinPoint.Z])
     # planar faces fill the middle of the view; a curved wall seen at an angle needs a much closer view
     size = max(span[1], 0.05) * 3 if face.SurfaceType == K.kPlaneSurface else max(span[0], 0.05) * 1.2
+    ring = _RING.get(safe(lambda: face.TransientKey))
+    if ring and face.SurfaceType == K.kPlaneSurface and not at:
+        size = ring / SAMPLE_REACH                  # every colour sample around the click lands on this face
     safe(lambda: cam.SetExtents(size, size))
     cam.ApplyWithoutTransition()
     time.sleep(0.3)

@@ -212,3 +212,10 @@ def test_path_words(job):
     assert paths.path_named("filePath") and paths.path_named("csv_path") and paths.path_named("outputDir")
     assert paths.path_named("export.saveAs") and paths.path_named("files[0]")
     assert not paths.path_named("profile") and not paths.path_named("material")
+
+
+def test_quoted_yield_strength_is_not_an_unbacked_stress():
+    out = verify.check("The side rail is 42.4 x 2.6 CHS in AS/NZS 1163 C250L0 grade steel (yield 250 MPa).", [])
+    assert not any(c.quantity == "stress_MPa" for c in out)
+    out = verify.check("Peak stress is 180 MPa.", [])
+    assert any(c.quantity == "stress_MPa" and c.status == "unsupported" for c in out)
