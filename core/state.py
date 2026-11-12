@@ -69,6 +69,7 @@ class State:
     job_dir: Path | None = None
     last_preview: str | None = None
     last_delta: str = ""
+    session_id: str = ""            # the Hermes chat of the tool call being handled (set by the pre_tool_call hook)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     # -- backends --------------------------------------------------------

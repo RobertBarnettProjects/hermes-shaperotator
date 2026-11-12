@@ -734,7 +734,7 @@ def _drawing_mod():
     return drawing
 
 
-def op_drawing_new(standard="AS1100", sheet_size="A3", orientation="landscape", properties=None):
+def op_drawing_new(standard="AS1100", sheet_size="A3", orientation="landscape", properties=None, drawing_units="mm"):
     d = _drawing_mod()
     try:
         _DRAWING["sheet"] = d.Sheet(standard, sheet_size, orientation, properties or {})

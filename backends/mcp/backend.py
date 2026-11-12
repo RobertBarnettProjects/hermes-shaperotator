@@ -1,7 +1,7 @@
 """Any CAD program behind an MCP server.
 
-Configure servers in the plugin settings (``plugins.hermes-shaperotator.mcp_servers`` in config.yaml, or the
-``HERMES_SHAPEROTATOR_MCP_SERVERS`` environment variable as JSON)::
+Configure servers in the plugin settings (``plugins.hermes-shaperotator.mcp_servers`` in config.yaml). A server
+process gets a minimal environment (what the OS needs) plus its own ``env`` mapping, never Hermes's provider keys::
 
     mcp_servers:
       inventor-mcp:                      # inventor-forge over MCP (same features as the built-in backend)

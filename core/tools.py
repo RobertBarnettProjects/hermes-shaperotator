@@ -5,9 +5,9 @@ import json
 import os
 import time
 import uuid
-from pathlib import Path
 from typing import Any, Callable
 
+from . import paths as _paths
 from .backend import BackendError
 from .evidence import EVIDENCE
 from .materials import resolve as resolve_material
@@ -32,11 +32,12 @@ def _call(op: str, **kw: Any) -> dict:
 
 
 def _path(p: str | None, default_name: str) -> str:
-    """Absolute path; relative or empty paths land in the job folder."""
+    """Absolute path; relative or empty paths land in the job folder. Taken literally (no ~ or $VAR expansion), '..'
+    refused, symlinks resolved. A write outside the job folders only gets here after the user approved it in the
+    pre_tool_call hook (see core/paths.py)."""
     if not p:
         return str(STATE.jobs() / default_name)
-    pp = Path(os.path.expandvars(os.path.expanduser(p)))
-    return str(pp if pp.is_absolute() else STATE.jobs() / pp)
+    return str(_paths.resolve(p))
 
 
 def safe(fn: Callable[..., str]) -> Callable[..., str]:
@@ -45,6 +46,12 @@ def safe(fn: Callable[..., str]) -> Callable[..., str]:
             return fn(args or {}, **kwargs)
         except BackendError as e:
             return _err(str(e))
+        except _paths.PathError as e:
+            return _err(str(e))
+        except ValueError as e:
+            if type(e).__name__ == "StandardError":
+                return _err(str(e))
+            return _err(f"bad arguments: {e}")
         except (KeyError, TypeError, ValueError) as e:
             return _err(f"bad arguments: {e}")
         except Exception as e:  # last resort: never raise into the agent loop
@@ -54,6 +61,24 @@ def safe(fn: Callable[..., str]) -> Callable[..., str]:
 
 
 # --------------------------------------------------------------------------- tools
+@safe
+def cad_standard(args: dict, **_: Any) -> str:
+    from . import standard as _std
+    a = args.get("action") or "get"
+    if a == "list":
+        return _ok(chosen=_std.chosen(), standards=_std.options())
+    if a == "set":
+        got = _std.choose(args["standard"], args.get("drawing_units") or "mm")
+        return _ok(set=True, **_std.T.summary(got["standard"], got["drawing_units"]),
+                   note="kept for the rest of this chat; drawings, fasteners and materials follow it")
+    if a == "get":
+        got = _std.chosen()
+        if not got:
+            return _ok(chosen=False, ask=_std.ASK)
+        return _ok(chosen=True, **_std.T.summary(got["standard"], got["drawing_units"]))
+    return _err(f"unknown action {a}")
+
+
 @safe
 def cad_status(args: dict, **_: Any) -> str:
     avail = {}
@@ -69,7 +94,10 @@ def cad_status(args: dict, **_: Any) -> str:
             doc = _call("status")
         except BackendError as e:
             doc = {"error": str(e)}
+    from . import standard as _std
+    std = _std.chosen()
     return _ok(backends=avail, document=doc, last_delta=STATE.last_delta or None,
+               standard=std or {"chosen": False, "ask": _std.ASK},
                job_folder=str(STATE.jobs()), drawing_qa={"dirty": STATE.qa.dirty, "issues": STATE.qa.last_issues})
 
 
@@ -209,7 +237,11 @@ def cad_drawing(args: dict, **_: Any) -> str:
     a = args["action"]
     g = args.get
     if a == "new":
-        r = _call("drawing_new", standard=g("standard") or STATE.settings.get("standard", "AS1100"),
+        from . import standard as _std
+        std = _std.for_call(g("standard") or "")
+        if not std:
+            return _err(_std.ASK)
+        r = _call("drawing_new", standard=std, drawing_units=(_std.chosen() or {}).get("drawing_units", "mm"),
                   sheet_size=g("sheet_size", "A3"), orientation=g("orientation", "landscape"),
                   properties=g("properties") or {})
     elif a == "part_sheet" and STATE.family == "freecad":
@@ -225,7 +257,12 @@ def cad_drawing(args: dict, **_: Any) -> str:
     elif a in ("part_sheet", "assembly_sheet"):
         if not g("model_path"):
             return _err("model_path is required (save the part first)")
+        from . import standard as _std
+        std = _std.for_call(g("standard") or "")
+        if not std:
+            return _err(_std.ASK)
         r = _call(f"drawing_{a}", model_path=_path(args["model_path"], ""), views=g("views", "front,top,right,iso"),
+                  standard=std,
                   scale=g("scale", 0), sheet_size=g("sheet_size", "A3"), up=g("up", "z"),
                   new_sheet=bool(g("new_sheet", False)))
     elif a == "check":
@@ -514,6 +551,8 @@ def cad_native(args: dict, **_: Any) -> str:
     if tool in ("analyze_stress", "analyze_modes", "result_at_point") or (tool == "study_report" and targs.get("only_this_study")):
         # the pre_tool_call hook showed the mouse/keyboard notice in Hermes's approval prompt and the user approved
         targs["user_notified"] = True
+    for key, value in _paths.written_args("cad_native", {"tool": tool, "args": targs}):
+        targs[key] = str(_paths.resolve(value))     # outside the job folders only after the user approved it
     r = _call("native", tool=tool, args=targs)
     if tool == "analyze_stress":
         r = _native_fea_evidence(targs, r)
@@ -645,5 +684,5 @@ HANDLERS = {
     "cad_status": cad_status, "cad_backend": cad_backend, "cad_document": cad_document,
     "cad_sketch": cad_sketch, "cad_feature": cad_feature, "cad_inspect": cad_inspect,
     "cad_parameters": cad_parameters, "cad_drawing": cad_drawing, "cad_transaction": cad_transaction,
-    "cad_python": cad_python,
+    "cad_python": cad_python, "cad_standard": cad_standard,
 }

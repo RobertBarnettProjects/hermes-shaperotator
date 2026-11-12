@@ -1,7 +1,8 @@
 """Drawings (IDW): sheets, views, dimensions, annotations, parts lists, one-shot sheets, QA, PDF.
 
-Sheet coordinates are millimetres from the sheet's lower-left corner. AS 1100 (default) uses
-third-angle projection; ISO uses first-angle.
+Sheet coordinates are millimetres from the sheet's lower-left corner. The drafting standard (template, projection
+angle, dimension style) is the session's choice (set_standard): AS 1100, ASME and JIS are third-angle; ISO, DIN,
+BS 8888 and GB first-angle.
 """
 from __future__ import annotations
 
@@ -10,13 +11,15 @@ import os
 import re
 import time
 
-from ..com import MM, InventorError, K, items, r, safe
+from ..com import MM, InventorError, K, items, late, r, safe
 from ..registry import tool
 from ..session import Session
 from .inspect import face_normal
 
 SIZES = {"A0": "kA0DrawingSheetSize", "A1": "kA1DrawingSheetSize", "A2": "kA2DrawingSheetSize",
-         "A3": "kA3DrawingSheetSize", "A4": "kA4DrawingSheetSize"}
+         "A3": "kA3DrawingSheetSize", "A4": "kA4DrawingSheetSize",
+         "A": "kADrawingSheetSize", "B": "kBDrawingSheetSize", "C": "kCDrawingSheetSize",      # ANSI (ASME)
+         "D": "kDDrawingSheetSize", "E": "kEDrawingSheetSize"}
 ORIENT = {"front": "kFrontViewOrientation", "top": "kTopViewOrientation", "right": "kRightViewOrientation",
           "left": "kLeftViewOrientation", "back": "kBackViewOrientation", "bottom": "kBottomViewOrientation",
           "iso": "kIsoTopRightViewOrientation", "iso_left": "kIsoTopLeftViewOrientation"}
@@ -91,23 +94,35 @@ def _model_doc(s: Session, model: str):
 
 
 @tool("drawing")
-def create_drawing(s: Session, standard: str = "AS1100", sheet_size: str = "A3", orientation: str = "landscape",
+def create_drawing(s: Session, standard: str = "", sheet_size: str = "A3", orientation: str = "landscape",
                    name: str = "") -> dict:
-    """New drawing document (ISO template; AS1100 = third-angle projection, ISO = first-angle)."""
+    """New drawing document to a drafting standard: the template, projection angle and dimension style follow it.
+
+    standard: AS1100, ISO, ASME, DIN, BS8888, JIS or GB; empty = the session's standard (set_standard), else AS1100
+    sheet_size: A0-A4, or A-E for ASME (A4..A0 are mapped to A..E)
+    """
+    from ..standards import STANDARDS
+    k = s.standard_key(standard)
+    spec = STANDARDS[k]
+    standard = k
+    if k == "ASME":
+        sheet_size = {"A4": "A", "A3": "B", "A2": "C", "A1": "D", "A0": "E"}.get(sheet_size.upper(), sheet_size)
     app = s.app
+    want = spec.get("template_in") if (k == "ASME" and s.drawing_units == "in") else spec["template"]
     try:
-        tpl = s.stock_template("ISO.idw") or app.FileManager.GetTemplateFile(K.kDrawingDocumentObject, K.kMetricSystemOfMeasure,
-                                                                             K.kISO_DraftingStandard)
+        tpl = s.stock_template(want) or s.stock_template("ISO.idw") or app.FileManager.GetTemplateFile(
+            K.kDrawingDocumentObject, K.kMetricSystemOfMeasure, K.kISO_DraftingStandard)
     except Exception:
         tpl = ""
     d = app.Documents.Add(K.kDrawingDocumentObject, tpl, True)
     d.Activate()
     s.set_current(d)
     std = safe(lambda: d.StylesManager.ActiveStandardStyle)
-    is_as = standard.upper().replace(" ", "") == "AS1100"
+    is_as = k in ("AS1100", "ASME")              # both: decimal point, no trailing zeros (metric)
+    third = spec["projection"] == "third"
     if std is not None:
-        safe(lambda: setattr(std, "FirstAngleProjection", not is_as))
-        if is_as:       # AS 1100.101: decimal point, no trailing zeros
+        safe(lambda: setattr(std, "FirstAngleProjection", not third))
+        if is_as:       # AS 1100.101 / ASME Y14.5 metric: decimal point, no trailing zeros
             od = safe(lambda: std.ActiveObjectDefaults)
             for attr in ("LinearDimensionStyle", "DiameterDimensionStyle", "RadialDimensionStyle",
                          "BaselineDimensionStyle"):
@@ -122,9 +137,13 @@ def create_drawing(s: Session, standard: str = "AS1100", sheet_size: str = "A3",
     _resize(sh, sheet_size, orientation)
     if name:
         safe(lambda: setattr(d, "DisplayName", name))
-    return {"drawing": d.DisplayName, "standard": standard,
-            "projection": "third-angle" if standard.upper().replace(" ", "") == "AS1100" else "first-angle",
-            "sheet": _sheet_row(sh)}
+    return {"drawing": d.DisplayName, "standard": standard, "template": os.path.basename(tpl) if tpl else "",
+            "projection": f"{spec['projection']}-angle", "sheet": _sheet_row(sh)}
+
+
+def _third(standard: str) -> bool:
+    from ..standards import third_angle
+    return third_angle(standard)
 
 
 def _resize(sh, size: str, orientation: str):
@@ -353,13 +372,12 @@ def drawing_curves(v, entity=None):
     """DrawingView.DrawingCurves is an indexed property with an optional argument, which late
     binding can't call; invoke it with explicit types."""
     import pythoncom
-    import win32com.client.dynamic as dyn
     o = v._oleobj_
     memid = o.GetIDsOfNames("DrawingCurves")
     arg = entity._oleobj_ if entity is not None else pythoncom.Missing
     res = o.InvokeTypes(memid, 0, pythoncom.DISPATCH_PROPERTYGET, (pythoncom.VT_DISPATCH, 0),
                         ((pythoncom.VT_VARIANT, 17),), arg)
-    return dyn.Dispatch(res)
+    return late(res)
 
 
 def _curves(v, entity=None) -> list:
@@ -1283,7 +1301,7 @@ def set_view_component_visibility(s: Session, view: str, occurrence: str, visibl
 
 @tool("drawing")
 def make_part_sheet(s: Session, model: str = "", views: str = "front,top,right,iso", scale: float = 0.0,
-                    sheet_size: str = "A3", standard: str = "AS1100", dimensions: bool = True,
+                    sheet_size: str = "A3", standard: str = "", dimensions: bool = True,
                     title: str = "", drawing_number: str = "", drawn_by: str = "", material: str = "") -> dict:
     """One-shot detail drawing of a part: new drawing, FRONT + projected TOP/RIGHT laid out for the
     projection angle and clear of the title block, a shaded ISOMETRIC, retrieved model dimensions,
@@ -1296,7 +1314,8 @@ def make_part_sheet(s: Session, model: str = "", views: str = "front,top,right,i
     md = _model_doc(s, model)
     if s.kind(md) != "part":
         raise InventorError("make_part_sheet needs a part (use make_assembly_sheet for assemblies)")
-    third = standard.upper().replace(" ", "") == "AS1100"
+    standard = s.standard_key(standard)
+    third = _third(standard)
     create_drawing(s, standard=standard, sheet_size=sheet_size)
     want = [w.strip().lower() for w in views.split(",") if w.strip()]
     L = _extents(md)
@@ -1437,7 +1456,7 @@ def _ga_sheet_size(s: Session, md, rows: int) -> str:
 
 @tool("drawing")
 def make_assembly_sheet(s: Session, model: str = "", scale: float = 0.0, sheet_size: str = "A3",
-                        standard: str = "AS1100", title: str = "", drawing_number: str = "",
+                        standard: str = "", title: str = "", drawing_number: str = "",
                         drawn_by: str = "") -> dict:
     """One-shot general-arrangement (GA) drawing of an assembly: FRONT + TOP, shaded ISOMETRIC, parts
     list above the title block, balloons, labels, title block, QA.
@@ -1447,7 +1466,8 @@ def make_assembly_sheet(s: Session, model: str = "", scale: float = 0.0, sheet_s
     md = _model_doc(s, model)
     if s.kind(md) != "assembly":
         raise InventorError("make_assembly_sheet needs an assembly")
-    third = standard.upper().replace(" ", "") == "AS1100"
+    standard = s.standard_key(standard)
+    third = _third(standard)
     if sheet_size.lower() == "auto":
         sheet_size = _ga_sheet_size(s, md, safe(lambda: md.ComponentDefinition.Occurrences.Count, 0))
     create_drawing(s, standard=standard, sheet_size=sheet_size)
@@ -1769,7 +1789,7 @@ def render_sheet(s: Session, path: str = "", width: int = 2400) -> dict:
         path = os.path.join(s.workdir, "renders", path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     d.Activate()
-    v = s.app.ActiveView
+    v = s.view()
     safe(lambda: v.Fit())
     h = int(width * sh.Height / sh.Width)
     v.SaveAsBitmap(path, int(width), h)

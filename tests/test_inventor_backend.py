@@ -68,6 +68,7 @@ def test_drawing_sheet_and_qa_gate(tmp_path):
     if not os.path.exists(model):
         st = call("cad_native", tool="status")
         model = (st.get("active") or {}).get("path", "")
+    assert call("cad_standard", action="set", standard="AS1100")["ok"]      # the user's choice for this chat
     r = call("cad_drawing", action="part_sheet", model_path=model)
     assert r["ok"], r
     assert P._pre_tool_call(tool_name="cad_drawing", args={"action": "export_pdf"})["action"] == "block"

@@ -616,8 +616,9 @@ def _pdf(html_path: Path) -> str:
     if not exe:
         return ""
     pdf = html_path.with_suffix(".pdf")
+    from .paths import child_env
     subprocess.run([exe, "--headless=new", "--disable-gpu", "--no-pdf-header-footer", f"--print-to-pdf={pdf}",
-                    html_path.as_uri()], capture_output=True, timeout=120)
+                    html_path.as_uri()], capture_output=True, timeout=120, env=child_env())
     return str(pdf) if pdf.is_file() else ""
 
 
@@ -780,7 +781,8 @@ def snapshot_save(name: str = "") -> dict:
 
 def snapshot_load(path: str) -> dict:
     """Unpack a snapshot into this session: its evidence, plans and history become this session's, and the model opens."""
-    zp = Path(os.path.expanduser(path))
+    from .paths import resolve
+    zp = resolve(path) if path else Path("")
     if not zp.is_file():
         raise ValueError(f"no such snapshot: {zp}")
     dest = _store(f"loaded-{zp.stem}")

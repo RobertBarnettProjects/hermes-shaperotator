@@ -16,11 +16,14 @@ NUM = r"(\d+(?:[.,]\d+)?)"
 
 # (quantity, regex). Group "v" is the value. Context words keep e.g. "M16" or "250 mm wide" out.
 PATTERNS: list[tuple[str, re.Pattern]] = [
+    # every run is bounded, so a padded table row can't make these backtrack (each run is at most 12 characters)
     ("safety_factor", re.compile(
-        r"(?:safety\s+factor|factor\s+of\s+safety|\bFoS\b|\bFOS\b|\bSF\b)(?:\s+(?:on|against|vs\.?|to|for)\s+\w+)?"
-        r"\s*(?:\(\w+\))?[\s|*:=≈~]*(?:of|is|was|about|around|approximately)?[\s|*:=≈~]*"
-        r"(?:about|around|approximately)?\s*(?P<v>\d+(?:\.\d+)?)", re.I)),
-    ("safety_factor", re.compile(r"(?P<v>\d+(?:\.\d+)?)\s*(?:×|x)?\s*(?:safety\s+factor|factor\s+of\s+safety)", re.I)),
+        r"(?:safety\s{1,3}factor|factor\s{1,3}of\s{1,3}safety|\bFoS\b|\bSF\b)"
+        r"(?:\s{1,3}(?:on|against|vs\.?|to|for)\s{1,3}\w{1,20})?"
+        r"[\s|*:=≈~]{0,12}(?:\(\w{1,20}\)[\s|*:=≈~]{0,12})?"
+        r"(?:(?:of|is|was|about|around|approximately)[\s|*:=≈~]{1,12}){0,2}(?P<v>\d+(?:\.\d+)?)", re.I)),
+    ("safety_factor", re.compile(
+        r"(?P<v>\d+(?:\.\d+)?)\s{0,3}(?:×|x)?\s{0,3}(?:safety\s{1,3}factor|factor\s{1,3}of\s{1,3}safety)", re.I)),
     ("stress_MPa", re.compile(r"(?P<v>\d+(?:\.\d+)?)\s*(?:MPa|N/mm²|N/mm2)\b", re.I)),
     ("disp_mm", re.compile(
         r"(?:deflect\w*|displac\w*|deform\w*|sag\w*|moves?|movement)[^.\n]{0,40}?(?P<v>\d+(?:\.\d+)?)\s*mm\b", re.I)),
@@ -71,7 +74,11 @@ def _in_code(text: str, pos: int) -> bool:
     return text.count("```", 0, pos) % 2 == 1
 
 
+MAX_SCAN = 20000      # characters of a reply the checker reads; a reply longer than this is checked up to here
+
+
 def extract(text: str) -> list[Claim]:
+    text = text[:MAX_SCAN]
     claims: list[Claim] = []
     seen: set[tuple[int, int]] = set()
     for qty, rx in PATTERNS:

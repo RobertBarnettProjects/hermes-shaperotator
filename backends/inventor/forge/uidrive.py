@@ -289,6 +289,49 @@ def pids_named(exe: str) -> list[int]:
     return [p for p in win32process.EnumProcesses() if _image_name(p).lower() == exe.lower()]
 
 
+def elevated(pid: int) -> bool | None:
+    """Is the process running as administrator? None if Windows won't say."""
+    import win32security
+    try:
+        hp = win32api.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
+    except Exception:
+        return None
+    try:
+        tok = win32security.OpenProcessToken(hp, win32con.TOKEN_QUERY)
+        try:
+            return bool(win32security.GetTokenInformation(tok, win32security.TokenElevation))
+        finally:
+            win32api.CloseHandle(tok)
+    except Exception:
+        return None
+    finally:
+        win32api.CloseHandle(hp)
+
+
+def mouse_ready() -> tuple[bool, str]:
+    """Can this process move the mouse and bring windows forward right now? Windows calls only. Windows silently
+    drops input from a normal program while the PC is locked, a UAC prompt is up, or an administrator window
+    (Task Manager, an elevated console) is in front, which otherwise shows up as 'the mouse keeps moving'."""
+    user32 = ctypes.windll.user32
+    desk = user32.OpenInputDesktop(0, False, 0x0100)           # DESKTOP_SWITCHDESKTOP: fails on the lock screen / UAC
+    if not desk:
+        return False, "the PC is locked or a Windows security prompt is showing; unlock it / answer the prompt first"
+    user32.CloseDesktop(desk)
+    fg = win32gui.GetForegroundWindow()
+    if fg:
+        fpid = win32process.GetWindowThreadProcessId(fg)[1]
+        if fpid != os.getpid() and elevated(fpid) and not elevated(os.getpid()):
+            title = win32gui.GetWindowText(fg) or "an untitled window"
+            return False, (f"an administrator window ({title!r}) is in front, and Windows blocks mouse and keyboard input "
+                           "from this program while it is; minimise or close it first")
+    try:
+        x, y = win32api.GetCursorPos()
+        win32api.SetCursorPos((x, y))
+    except Exception as e:
+        return False, f"Windows refused to move the mouse ({e}); an administrator window may be in front"
+    return True, ""
+
+
 def solver_windows(pids: list[int] | None = None) -> list[str]:
     """Titles of Stress Analysis solve/report windows that are open. Inventor must not get COM calls while
     one is running: polling it during a solve has crashed it. Uses Windows calls only."""

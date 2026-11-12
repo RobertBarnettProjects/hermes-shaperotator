@@ -118,6 +118,59 @@ class _Constants:
 K = _Constants()
 
 
+# --------------------------------------------------------------------------- late binding
+_LateClass = None
+
+
+def _late_class():
+    """A dynamic.CDispatch whose *method* results stay late-bound too.
+
+    pywin32 builds late-bound methods (Documents.Open, .Item, .Add ...) with win32com.client.Dispatch, which
+    consults the gen_py cache. On a PC where that cache holds Inventor's type library, a method declared to
+    return Document comes back as the early-bound base Document class, with no ComponentDefinition even for a
+    part, so everything after it fails. Properties are unaffected. This class swaps that Dispatch for one that
+    always wraps late, so behaviour no longer depends on what else has run on the machine."""
+    global _LateClass
+    if _LateClass is None:
+        import win32com.client.dynamic as dyn
+
+        def _late_dispatch(ob, userName=None, *_a, **_k):
+            return late(ob, userName)
+
+        class LateDispatch(dyn.CDispatch):
+            def _wrap_dispatch_(self, ob, userName=None, returnCLSID=None):
+                return late(ob, userName)
+
+            def _make_method_(self, name):
+                m = super()._make_method_(name)
+                if m is not None:
+                    m.__func__.__globals__["Dispatch"] = _late_dispatch
+                return m
+
+        _LateClass = LateDispatch
+    return _LateClass
+
+
+def late(obj, user_name: str | None = None):
+    """Late-bound wrapper for any COM object (raw PyIDispatch, early-bound or dynamic). Other values pass through."""
+    import pythoncom
+    import win32com.client.dynamic as dyn
+    if obj is None:
+        return None
+    cls = _late_class()
+    if isinstance(obj, cls):
+        return obj
+    raw = getattr(obj, "_oleobj_", obj)
+    if type(raw).__name__ == "PyIUnknown":
+        try:
+            raw = raw.QueryInterface(pythoncom.IID_IDispatch)
+        except pythoncom.com_error:
+            return obj
+    if type(raw).__name__ != "PyIDispatch":
+        return obj
+    return dyn.Dispatch(raw, user_name, createClass=cls)
+
+
 # --------------------------------------------------------------------------- helpers
 def items(collection) -> Iterator[Any]:
     """1-based COM collection -> Python iterator."""
@@ -173,8 +226,7 @@ def typed_call(obj, method: str, *args):
         res = obj._oleobj_.InvokeTypes(fd.memid, 0, fd.invkind, (rt, 0), tuple(argtypes), *full)
         if not isinstance(res, tuple):
             res = (res,)
-        import win32com.client.dynamic as dyn
-        return tuple(dyn.Dispatch(v) if type(v).__name__ == "PyIDispatch" else v for v in res)
+        return tuple(late(v) if type(v).__name__ == "PyIDispatch" else v for v in res)
     raise InventorError(f"{method} not found on {ti.GetDocumentation(-1)[0]}")
 
 

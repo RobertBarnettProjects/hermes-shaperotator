@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import queue
 import subprocess
 import threading
@@ -56,7 +55,9 @@ class McpClient:
             self.close()
         self._tools = None
         self._write_lock = threading.Lock()
-        env = {**os.environ, **{k: str(v) for k, v in self.env.items()}, "PYTHONUNBUFFERED": "1"}
+        from .paths import child_env
+        # only what the OS needs plus the server's own configured env: never Hermes's provider keys
+        env = child_env({**{k: str(v) for k, v in self.env.items()}, "PYTHONUNBUFFERED": "1"})
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, cwd=self.cwd or None, env=env,

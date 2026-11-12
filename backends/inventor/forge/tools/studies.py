@@ -63,7 +63,7 @@ def _select(s: Session, study: str, item: str = "") -> None:
     and a load in a collapsed folder can't be selected until the folder is open."""
     node = _study(s, study)
     _pane(s).Activate()
-    d = s.doc()
+    d = s.front()                         # selections and the command after them act on the active document
     d.SelectSet.Clear()
     target = node
     if item:
@@ -204,37 +204,116 @@ def rename_study(s: Session, study: str, new_name: str) -> dict:
     return {"renamed": new_name}
 
 
-def _copy(s: Session, pid: int, source: str, new_name: str) -> tuple[str, list[str]]:
-    before_params = set(_sa_params(s))
+COPY_WAIT = 40.0          # s: a large study can take well over 8 s to appear, and a retry then makes a second copy
+
+
+def _sa_list(s: Session) -> list[tuple[str, str]]:
+    """Every sa_N parameter as (name, expression), lowest number first."""
+    p = _sa_params(s)
+    return [(n, p[n].Expression) for n in _by_number(p)]
+
+
+def _settled_sa(s: Session, tries: int = 8) -> list[tuple[str, str]]:
+    """The sa_ parameters once Inventor has stopped adding and renumbering them (two reads 1 s apart agree)."""
+    last = _sa_list(s)
+    for _ in range(tries):
+        time.sleep(1.0)
+        now = _sa_list(s)
+        if now == last:
+            return now
+        last = now
+    return last
+
+
+def _inserted(before: list[tuple[str, str]], after: list[tuple[str, str]]) -> list[str]:
+    """Names of the parameters a copy added. Inventor renumbers every sa_ parameter when it copies a study, so names
+    from before the copy mean nothing afterwards; values still do. The parameters that were there before are matched
+    into the new list by value, in order, lowest numbers first, so the template keeps the lowest-numbered set; every
+    parameter left over belongs to the copy (sometimes two sets of it: a copy can briefly hold a transient set too)."""
+    i, extra = 0, []
+    for name, value in after:
+        if i < len(before) and U.same_value(value, before[i][1]):
+            i += 1
+        else:
+            extra.append(name)
+    if i != len(before):
+        raise InventorError("could not match the study parameters from before the copy against the ones after it "
+                            f"({i} of {len(before)} matched by value); the copy's load parameters are unknown, so "
+                            "nothing was written. Save, reopen the file and try again")
+    return extra
+
+
+def _copy(s: Session, pid: int, source: str, new_name: str) -> dict:
+    """Copy a study. Returns the copy's name, its parameters (see _inserted) and any duplicate copies a retry left."""
+    before_params = _settled_sa(s, tries=2)
     before = set(_study_nodes(s))
-    copy = None
-    for _ in range(3):                      # the command is occasionally ignored just after a document switch
+    copy, attempts = None, 0
+    for attempts in range(1, 4):            # the command is occasionally ignored just after a document switch
         _select(s, source)
         _run_command(s, "FeaSimulationCopyCmd")
         t0 = time.time()
-        while time.time() - t0 < 8 and copy is None:
-            time.sleep(0.5)
+        while time.time() - t0 < COPY_WAIT and copy is None:
+            time.sleep(1.0)
             copy = next((n for n in _study_nodes(s) if n not in before), None)
         if copy:
             break
     if copy is None:
-        raise InventorError(f"Inventor did not copy study {source!r}")
+        raise InventorError(f"Inventor did not copy study {source!r} (waited {COPY_WAIT:.0f} s, {attempts} tries)")
+    time.sleep(2.0)                          # a slow earlier attempt may still land
+    duplicates = [n for n in _study_nodes(s) if n not in before and n != copy]
     if new_name:
         _rename(s, pid, copy, new_name)
         copy = new_name
-    return copy, _by_number(n for n in _sa_params(s) if n not in before_params)
+    after = _settled_sa(s)
+    return {"study": copy, "parameters": _inserted(before_params, after), "duplicates": duplicates}
+
+
+def _sets(names: list[str], size: int, what: str) -> list[list[str]]:
+    """Split a copy's parameters into sets of one study's size."""
+    if not names or size <= 0 or len(names) % size:
+        raise InventorError(f"{what}: the copy added {len(names)} load parameters, which isn't a whole number of sets of "
+                            f"{size}; nothing was written. list_analysis_parameters shows them")
+    sets = [names[k:k + size] for k in range(0, len(names), size)]
+    for one in sets:                          # one study's parameters are numbered in a run; a gap means a bad match
+        nums = [int(n.split("_")[1]) for n in one]
+        if nums != list(range(nums[0], nums[0] + len(nums))):
+            raise InventorError(f"{what}: the copy's load parameters {one} are not one numbered run, so they can't be told "
+                                "apart from other studies' by value; nothing was written")
+    return sets
+
+
+def _write_checked(s: Session, sets: list[list[str]], values: list) -> list[dict]:
+    """Write the same values into every parameter set of a copy, then read them back."""
+    p = _sa_params(s)
+    first = [p[n].Expression for n in sets[0]]
+    for other in sets[1:]:
+        shown = [p[n].Expression for n in other]
+        if not all(U.same_value(a, b) for a, b in zip(shown, first)):
+            raise InventorError(f"the copy holds parameter sets that disagree ({first} vs {shown}); nothing was written")
+    for names in sets:
+        _write(s, {n: v for n, v in zip(names, values) if v is not None})
+    p = _sa_params(s)
+    bad = [{"parameter": n, "wanted": v, "shown": p[n].Expression}
+           for names in sets for n, v in zip(names, values) if v is not None and not U.same_value(p[n].Expression, str(v))]
+    if bad:
+        raise InventorError(f"Inventor did not keep the load values written: {bad}")
+    return [_param_row(p[n]) for n in sets[-1]]
 
 
 @tool("analysis")
 def copy_study(s: Session, source: str, new_name: str = "") -> dict:
     """Copy a study, keeping its faces, supports and loads, so no faces need picking. Returns the copy's own load
-    parameters, in the same order as the original's values (set them with set_analysis_parameters).
+    parameters, in the same order as the original's values (set them with set_analysis_parameters). Inventor
+    renumbers every load parameter when it copies a study; the copy's ones are found by matching values.
 
     new_name: name for the copy (default: Inventor's)
     """
-    name, new = _copy(s, _pid(s), source, new_name)
+    c = _copy(s, _pid(s), source, new_name)
     all_params = _sa_params(s)
-    return {"study": name, "parameters": [_param_row(all_params[n]) for n in new]}
+    out = {"study": c["study"], "parameters": [_param_row(all_params[n]) for n in c["parameters"]]}
+    if c["duplicates"]:
+        out["warning"] = f"a slow copy also left {c['duplicates']}; delete them with delete_study_item"
+    return out
 
 
 @tool("analysis", mutates=False)
@@ -342,7 +421,7 @@ def _picture(s: Session, study: str, result: str, view: str) -> str:
     stem = re.sub(r"\W+", "_", f"{study} {result}")
     png = os.path.join(s.workdir, "renders", f"{stem}.png")
     os.makedirs(os.path.dirname(png), exist_ok=True)
-    cam = s.app.ActiveView.Camera
+    cam = s.view().Camera
     if view:
         key = VIEWS.get(view.lower())
         if not key:
@@ -350,7 +429,7 @@ def _picture(s: Session, study: str, result: str, view: str) -> str:
         cam.ViewOrientationType = getattr(K, key)
     cam.Fit()
     cam.ApplyWithoutTransition()
-    s.app.ActiveView.SaveAsBitmap(png, 1600, 1000)
+    s.view().SaveAsBitmap(png, 1600, 1000)
     return png
 
 
@@ -470,7 +549,7 @@ def result_at_point(s: Session, study: str, face, result: str = "Von Mises Stres
         raise InventorError("could not read the colour scale")
     bands = bands or 5
     _look_at_face(s, f, at=point)
-    hwnd = s.app.ActiveView.HWND
+    hwnd = s.view().HWND
     l, t_, r_, b_ = win32gui.GetClientRect(hwnd)
     centre = win32gui.ClientToScreen(hwnd, ((r_ - l) // 2, (b_ - t_) // 2))
     win32api.SetCursorPos(win32gui.ClientToScreen(hwnd, (r_ - 5, b_ - 5)))   # pointer off the spot: hovering changes colours
@@ -523,6 +602,8 @@ def mesh_convergence(s: Session, study: str, fractions: list[float] | None = Non
                      timeout: float = 3600.0) -> dict:
     """Check that a study's peak doesn't depend on the mesh: copies it at finer average element sizes, solves each and
     compares the peaks. No mouse needed. (analyze_stress's refinements= uses Inventor's own refinement instead.)
+    Each size is solved, which is the only check that catches a degenerate element: Inventor meshes such a model
+    without complaint and reports it at solve time, so a mesh preview alone can't vet a model.
 
     fractions: average element size as a fraction of the model size, coarse to fine (default 0.1, 0.07, 0.05)
     """
@@ -707,14 +788,15 @@ def _run_case(s: Session, pid: int, template: str, case: dict, want: list[str], 
         values = case.get("values") or []
         if name in _study_nodes(s):
             raise InventorError(f"a study named {name!r} already exists but isn't recorded as finished; delete or rename it")
-        _, new = _copy(s, pid, template, name)
+        c = _copy(s, pid, template, name)
+        written = []
         if values:
-            if len(new) < len(values):
-                raise InventorError(f"case {name!r} gives {len(values)} values but the copy has {len(new)} load parameters")
-            new = new[-len(values):]             # a retried copy can leave a few unused numbers before the real block
-            _write(s, {n: v for n, v in zip(new, values) if v is not None})
+            # every set the copy holds gets the values (a transient set may be the one Inventor solves with), and
+            # they are read back, so a case can never solve with the template's loads while looking finished
+            written = _write_checked(s, _sets(c["parameters"], len(values), f"case {name!r}"), values)
         secs, warnings = _simulate(s, pid, timeout=timeout, front=False) if not _activate(s, name) else (0.0, [])
         row = {"status": "done", "solve_seconds": r(secs, 1), "warnings": warnings, "values": values, "template": template,
+               "parameters_written": written, "duplicate_copies": c["duplicates"],
                "results": {res: _read_max(s, pid, name, res) for res in want}}
         row["saved"] = _save(s)
         row["total_seconds"] = r(time.time() - t0, 1)

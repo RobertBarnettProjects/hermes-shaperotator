@@ -77,10 +77,28 @@ def _native_executes_code(args: Any) -> bool:
     return name == mapped or bool(re.search(r"python|exec|eval|script|shell|run_code|execute", name + " " + description, re.I))
 
 
-def _pre_tool_call(tool_name: str = "", args: Any = None, **_: Any):
-    if str(tool_name).startswith("cad_"):
-        from .core.workbench import LIVE
-        LIVE.enter()
+NL = chr(10)
+
+
+def _pre_tool_call(tool_name: str = "", args: Any = None, **kw: Any):
+    if not str(tool_name).startswith("cad_"):
+        return None
+    from .core.paths import outside_writes
+    from .core.workbench import LIVE
+    STATE.session_id = str(kw.get("session_id") or "")
+    outside, bad = outside_writes(str(tool_name), args)
+    if bad:
+        return {"action": "block", "message": "hermes-shaperotator: " + "; ".join(bad)}
+    LIVE.enter()
+    out = _pre_tool_call_inner(tool_name, args, **kw)
+    if outside and (out is None or out.get("action") == "approve"):
+        note = (f"hermes-shaperotator wants {tool_name} to write outside its job folder ({STATE.jobs()}):" + NL * 2
+                + NL.join(outside) + NL * 2 + "Approve only if you asked for the file to go there.")
+        out = {"action": "approve", "message": note + (NL * 2 + out["message"] if out else "")}
+    return out
+
+
+def _pre_tool_call_inner(tool_name: str = "", args: Any = None, **_: Any):
     if tool_name == "cad_python" or (tool_name == "cad_native" and _native_executes_code(args)):
         code = str((args or {}).get("code", args) if isinstance(args, dict) else "")
         preview = code if len(code) <= 1200 else code[:1200] + "\n... (truncated)"
@@ -188,6 +206,13 @@ def _pre_llm_call(session_id: str = "", **_: Any):
     if not STATE.backends or (session_id and session_id not in _CAD_SESSIONS):
         return None
     parts = [f"backend={STATE.backend_name}"]
+    try:
+        from .core import standard as _std
+        got = _std.chosen(session_id)
+        parts.append(f"standard for this chat: {got['standard']} ({got['drawing_units']} drawings)" if got
+                     else "standard: not chosen yet - " + _std.ASK)
+    except Exception:
+        pass
     if STATE.last_delta:
         parts.append(f"last delta: {STATE.last_delta}")
     if STATE.qa.last_issues is not None or STATE.qa.dirty:
@@ -261,17 +286,12 @@ def _slash(raw_args: str = "", **_: Any) -> str:
 # --------------------------------------------------------------------------- register
 def register(ctx) -> None:
     settings: dict[str, Any] = {}
-    for key, default in (("backend", "freecad"), ("freecad_path", ""), ("standard", "AS1100"),
+    for key, default in (("backend", "freecad"), ("freecad_path", ""), ("standard", ""),
                          ("job_dir", ""), ("inventor_visible", True), ("mcp_servers", {})):
         try:
             settings[key] = ctx.get_config(key, default)
         except Exception:
             settings[key] = default
-    if not settings.get("mcp_servers") and os.environ.get("HERMES_SHAPEROTATOR_MCP_SERVERS"):
-        try:
-            settings["mcp_servers"] = json.loads(os.environ["HERMES_SHAPEROTATOR_MCP_SERVERS"])
-        except ValueError:
-            pass
     if not isinstance(settings.get("mcp_servers"), dict):
         settings["mcp_servers"] = {}
     STATE.settings.update(settings)

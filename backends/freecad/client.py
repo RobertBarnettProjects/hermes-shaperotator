@@ -10,6 +10,11 @@ import sys
 import threading
 from typing import Any
 
+try:
+    from ...core.childenv import child_env as _child_env
+except ImportError:                     # loaded on its own (tests, the worker's folder)
+    from core.childenv import child_env as _child_env
+
 WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker.py")
 
 
@@ -78,7 +83,7 @@ class FreeCADClient:
             [self.python, "-I", "-u", WORKER],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", bufsize=1, creationflags=flags,
-            cwd=os.path.dirname(self.python),
+            cwd=os.path.dirname(self.python), env=_child_env(prefixes=("FREECAD", "HERMES_SHAPEROTATOR_DEBUG")),
         )
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         hello = self._read_reply(0)

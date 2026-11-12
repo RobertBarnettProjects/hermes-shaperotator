@@ -10,7 +10,13 @@ metadata:
 
 # Parametric modelling with hermes-shaperotator
 
-All lengths are millimetres. Australian Standards by default (AS 1100 drawings, AS/NZS steels).
+All lengths are millimetres.
+
+**Standard:** at the start of a CAD chat call `cad_standard(action="get")`. If nothing is chosen, ask the user
+once which standard to work to (the `clarify` tool if you have it; options from `cad_standard(action="list")`:
+AS 1100, ISO, ASME, DIN, BS 8888, JIS, GB), then `cad_standard(action="set", standard=...)`. It holds for the
+rest of the chat: drawing template and projection angle, general tolerance note, and the fastener and material
+series you suggest (e.g. AS/NZS 3678 Grade 350 for AS, S355 for ISO/DIN, ASTM A36 for ASME). Don't ask again.
 
 ## Workflow
 

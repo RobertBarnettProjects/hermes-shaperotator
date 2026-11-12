@@ -14,6 +14,45 @@ from ..session import Session
 _NS: dict = {}
 
 
+# --------------------------------------------------------------------------- standards
+@tool("system")
+def list_standards(s: Session) -> dict:
+    """The drafting/engineering standards this server can work to, with what each one sets (projection, drawing
+    standard, general tolerance, threads, fasteners, materials, sheet sizes). Show these to the user to choose from."""
+    from ..standards import STANDARDS, summary
+    return {"chosen": s.standard, "standards": [summary(k) for k in STANDARDS]}
+
+
+@tool("system")
+def set_standard(s: Session, standard: str, drawing_units: str = "mm") -> dict:
+    """Set the standard for the rest of this session (ask the user first; list_standards has the options). Drawings
+    use its template, projection angle and dimension style; standard parts and materials follow its series.
+
+    standard: AS1100, ISO, ASME, DIN, BS8888, JIS or GB (names like "AS 1100" or "ANSI" are accepted)
+    drawing_units: mm, or in (ASME only: inch drawing template; models stay in mm)
+    """
+    from ..com import InventorError
+    from ..standards import key, summary
+    k = key(standard)
+    u = (drawing_units or "mm").lower()
+    if u not in ("mm", "in"):
+        raise InventorError("drawing_units must be mm or in")
+    if u == "in" and k != "ASME":
+        raise InventorError("inch drawings are only offered with ASME")
+    s.standard, s.drawing_units = k, u
+    return {"set": True, **summary(k, u)}
+
+
+@tool("system")
+def get_standard(s: Session) -> dict:
+    """The standard chosen for this session, or chosen=false if the user hasn't been asked yet."""
+    from ..standards import DEFAULT, summary
+    if not s.standard:
+        return {"chosen": False, "default_if_not_asked": DEFAULT,
+                "ask": "Ask the user which standard to work to (list_standards), then call set_standard."}
+    return {"chosen": True, **summary(s.standard, s.drawing_units)}
+
+
 @tool("system")
 def execute_python(s: Session, code: str) -> dict:
     """Run Python in a persistent namespace with the live Inventor objects: app, doc, cdef (component

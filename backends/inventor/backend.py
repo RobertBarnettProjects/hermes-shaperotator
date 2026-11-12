@@ -209,7 +209,9 @@ class InventorBackend(CadBackend):
         if op == "transaction":
             return f("transaction", action=k.get("action", "begin"), name=k.get("name", "hermes-shaperotator"))
         if op == "drawing_new":
-            r = f("create_drawing", standard=k.get("standard", "AS1100"), sheet_size=k.get("sheet_size", "A3"),
+            if k.get("standard"):
+                f("set_standard", standard=k["standard"], drawing_units=k.get("drawing_units") or "mm")
+            r = f("create_drawing", standard=k.get("standard", ""), sheet_size=k.get("sheet_size", "A3"),
                   orientation=k.get("orientation", "landscape"))
             if k.get("properties"):
                 r["properties"] = f("set_title_block_field", fields=k["properties"])
@@ -220,10 +222,10 @@ class InventorBackend(CadBackend):
         if op == "drawing_part_sheet":
             return f("make_part_sheet", model=k.get("model_path", ""), views=k.get("views", "front,top,right,iso"),
                      scale=float(k.get("scale") or 0), sheet_size=k.get("sheet_size", "A3"),
-                     standard=self.settings.get("standard", "AS1100"))
+                     standard=k.get("standard") or self.settings.get("standard") or "")
         if op == "drawing_assembly_sheet":
             return f("make_assembly_sheet", model=k.get("model_path", ""), scale=float(k.get("scale") or 0),
-                     sheet_size=k.get("sheet_size", "A3"), standard=self.settings.get("standard", "AS1100"))
+                     sheet_size=k.get("sheet_size", "A3"), standard=k.get("standard") or self.settings.get("standard") or "")
         if op == "drawing_check":
             r = f("check_drawing")
             return {"report": r["report"], "issues": r["total"], "issue_list": r["issues"]}

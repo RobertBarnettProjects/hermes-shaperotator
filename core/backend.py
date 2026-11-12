@@ -53,7 +53,7 @@ OPS: dict[str, str] = {
     # transactions
     "transaction": "begin / commit / abort an undo group",
     # drawings
-    "drawing_new": "New drawing document (AS1100 or ISO)",
+    "drawing_new": "New drawing document to the chat's standard (AS1100, ISO, ASME, DIN, BS8888, JIS, GB)",
     "drawing_part_sheet": "One-shot detail sheet for a part",
     "drawing_assembly_sheet": "One-shot GA sheet for an assembly",
     "drawing_check": "Drawing QA report",

@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import inspect
 import time
+from concurrent.futures import TimeoutError as FutureTimeout
 import traceback
 from typing import Any
 
+from .standards import StandardError
 from .com import Apartment, InventorError, com_error_text
 from .registry import TOOLS, load_all
 from .session import Session
@@ -23,6 +25,28 @@ def _plain(v: Any) -> Any:
 
 
 RPC_BUSY = (-2147418111, -2147417846)     # RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER
+DEFAULT_WAIT = 1800.0                     # s: how long a call may hold the COM thread, unless the tool says otherwise
+BATCH_ARGS = {"cases": None, "fractions": 3}   # list arguments that repeat a tool's own timeout (default count)
+
+
+def call_budget(fn, args: dict, default: float | None = DEFAULT_WAIT) -> float | None:
+    """How long to wait for a tool. A tool with its own timeout argument (a solve) gets that, once per case or mesh
+    size for batch tools, plus time for the copying, reading and saving around it, so the wait never ends before
+    the tool's own limit does (a solve allowed 3600 s used to be cut off by the 1800 s default)."""
+    sig = inspect.signature(fn).parameters
+    if "timeout" not in sig or default is None:
+        return default
+    own = args.get("timeout", sig["timeout"].default)
+    try:
+        own = float(own)
+    except (TypeError, ValueError):
+        return default
+    n = 1
+    for name, fallback in BATCH_ARGS.items():
+        if name in sig:
+            v = args.get(name)
+            n = max(n, len(v) if isinstance(v, (list, tuple)) else (fallback or 1))
+    return max(default, n * (own + 600.0) + 300.0)
 
 
 def _is_busy(e: BaseException) -> bool:
@@ -36,7 +60,7 @@ class Forge:
         self.session = Session(visible=visible)
         self.tools = TOOLS
 
-    def call(self, name: str, args: dict | None = None, timeout: float | None = 1800) -> dict:
+    def call(self, name: str, args: dict | None = None, timeout: float | None = DEFAULT_WAIT) -> dict:
         t = self.tools.get(name)
         if t is None:
             raise InventorError(f"unknown tool {name!r}")
@@ -74,6 +98,8 @@ class Forge:
                 out = attempt()
             except InventorError:
                 raise
+            except StandardError as e:
+                raise InventorError(str(e)) from None
             except TypeError as e:
                 if "argument" in str(e):
                     raise InventorError(f"{name}: {e}") from e
@@ -84,7 +110,12 @@ class Forge:
                 raise
             return _plain(out) if isinstance(out, dict) else {"result": _plain(out)}
 
-        return self.apartment.run(run, timeout=timeout)
+        wait = call_budget(t.fn, args, timeout)
+        try:
+            return self.apartment.run(run, timeout=wait)
+        except FutureTimeout:
+            raise InventorError(f"{name}: no answer after {wait:.0f} s. The call may still be running in Inventor (a solve "
+                                "carries on regardless); check solve_state before calling anything else") from None
 
     def safe_call(self, name: str, args: dict | None = None) -> dict:
         """Never raises: {"ok": False, "error": ...} on failure."""

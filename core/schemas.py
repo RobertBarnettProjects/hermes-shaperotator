@@ -37,7 +37,7 @@ CAD_DOCUMENT = _tool(
     "cad_document",
     "Create, open, save, close or export CAD documents. All lengths are millimetres. "
     "export formats: STEP, STL, 3MF, IGES (and PDF for an Inventor drawing). "
-    "Paths may be absolute; relative paths go to the session's job folder.",
+    "Relative paths go to the session's job folder (use them). A write outside it asks the user first; '..', ~ and $VARS are not expanded.",
     {
         "action": {"type": "string", "enum": ["new_part", "new_assembly", "open", "save", "close", "export"]},
         "path": {**_STR, "description": "File path for open/save/export"},
@@ -131,7 +131,7 @@ CAD_DRAWING = _tool(
     "Engineering drawings (AS 1100 third-angle by default, ISO first-angle on request). "
     "Workflow: new → part_sheet (or assembly_sheet) → check → render (look at it) → fix → check again → "
     "export_pdf. export_pdf is BLOCKED until the latest check reports zero issues.\n"
-    "  new: standard (AS1100|ISO), sheet_size (A0-A4), orientation\n"
+    "  new: standard (default: this chat's, see cad_standard), sheet_size (A0-A4; A-E for ASME), orientation\n"
     "  part_sheet / assembly_sheet: model_path (Inventor: saved .ipt/.iam; FreeCAD: optional — the active part, "
     "or a .FCStd/.step), views ('front,top,right,iso'), scale (0 = auto), sheet_size, up ('z' for parts built here)\n"
     "  properties (FreeCAD): title block fields — title, drawing_number, material, drawn_by, date, sheet\n"
@@ -292,5 +292,19 @@ CAD_ARTIFACT = _tool(
     ["action"],
 )
 
-ALL = [CAD_FEA, CAD_STATUS, CAD_BACKEND, CAD_DOCUMENT, CAD_SKETCH, CAD_FEATURE, CAD_INSPECT, CAD_PARAMETERS,
+CAD_STANDARD = _tool(
+    "cad_standard",
+    "The drafting/engineering standard this chat works to. At the start of a CAD chat call get; if nothing is "
+    "chosen, ask the user ONCE which standard to use (clarify tool if available; list gives the options: AS1100 "
+    "Australian, ISO, ASME American, DIN German, BS8888 British, JIS Japanese, GB Chinese), then set. The choice is "
+    "kept for the rest of the chat: drawing template, projection angle (third: AS1100/ASME/JIS, first: "
+    "ISO/DIN/BS8888/GB), dimension style, general tolerance note, and the fastener and material series to suggest. "
+    "Don't ask again unless the user wants to change it.",
+    {"action": {"type": "string", "enum": ["get", "list", "set"]},
+     "standard": {**_STR, "description": "for set: AS1100, ISO, ASME, DIN, BS8888, JIS or GB"},
+     "drawing_units": {**_STR, "description": "for set: mm (default) or in (ASME only; models stay in mm)"}},
+    ["action"],
+)
+
+ALL = [CAD_STANDARD, CAD_FEA, CAD_STATUS, CAD_BACKEND, CAD_DOCUMENT, CAD_SKETCH, CAD_FEATURE, CAD_INSPECT, CAD_PARAMETERS,
        CAD_DRAWING, CAD_TRANSACTION, CAD_PYTHON, CAD_NATIVE, CAD_PLAN, CAD_HISTORY, CAD_ARTIFACT]

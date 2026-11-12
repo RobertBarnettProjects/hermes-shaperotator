@@ -100,14 +100,22 @@ def list_projects(s: Session) -> dict:
 
 
 @tool("session")
-def set_active_project(s: Session, project: str) -> dict:
+def set_active_project(s: Session, project: str, other_inventors_ok: bool = False) -> dict:
     """Switch Inventor's active project (by name or .ipj path). Inventor only allows this with no documents open.
+    The active project is a per-user setting shared by every Inventor on the PC, so this refuses while another
+    Inventor is running (its open files would start resolving against the new project).
 
     project: project name or full path to the .ipj file
+    other_inventors_ok: switch anyway with other Inventors running, after the user has agreed
     """
+    from .. import uidrive as U
     app = s.app
     if safe(lambda: app.Documents.VisibleDocuments.Count, 0):
         raise InventorError("Inventor can only change project with no documents open; close them first")
+    others = [p for p in U.pids_named("Inventor.exe") if p != s.pid]
+    if others and not other_inventors_ok:
+        raise InventorError(f"another Inventor is running (process {others}); the active project is shared with it, so "
+                            "changing it here changes it there too. Close it, or ask the user and pass other_inventors_ok=true")
     m = app.DesignProjectManager
     p = safe(lambda: m.DesignProjects.ItemByName(project))
     if p is None and os.path.exists(project):
@@ -187,16 +195,36 @@ def create_assembly(s: Session, name: str = "") -> dict:
     return {"created": _doc_info(s, d)}
 
 
+def _outside_project(s: Session, path: str) -> bool:
+    ws = safe(lambda: s.app.DesignProjectManager.ActiveDesignProject.WorkspacePath, "") or ""
+    if not ws:
+        return False
+    a, b = os.path.normcase(os.path.abspath(path)), os.path.normcase(os.path.abspath(ws))
+    return not (a == b or a.startswith(b.rstrip("\\/") + os.sep))
+
+
 @tool("documents")
 def open_document(s: Session, path: str) -> dict:
-    """Open an Inventor file (.ipt .iam .idw .dwg) or import STEP/IGES/SAT, and activate it."""
+    """Open an Inventor file (.ipt .iam .idw .dwg) or import STEP/IGES/SAT, and activate it. Opens in Inventor's
+    silent mode, so a file outside the active project, or with missing references, can't stop at a prompt."""
     path = os.path.abspath(os.path.expanduser(path))
     if not os.path.exists(path):
         raise InventorError(f"file not found: {path}")
-    d = s.app.Documents.Open(path, True)
+    with _silent(s), _dialog_watchdog(s) as dog:
+        d = s.app.Documents.Open(path, True)
     d.Activate()
     s.set_current(d)
-    return {"opened": _doc_info(s, d)}
+    out = {"opened": _doc_info(s, d)}
+    if _outside_project(s, path):
+        out["note"] = ("the file is outside the active project's workspace; references are resolved from its own "
+                       "folder (list_projects / set_active_project to change project)")
+    if dog.cancelled:
+        out["dialogs_cancelled"] = dog.cancelled
+    missing = safe(lambda: [os.path.basename(x.FullFileName) for x in items(d.File.ReferencedFileDescriptors)
+                            if safe(lambda x=x: bool(x.ReferenceMissing), False)], [])
+    if missing:
+        out["missing_references"] = missing[:20]
+    return out
 
 
 def _find_doc(s: Session, name: str):
@@ -437,7 +465,7 @@ def export_document(s: Session, path: str, format: str = "") -> dict:
 @tool("view")
 def set_view(s: Session, view: str = "iso", fit: bool = True) -> dict:
     """Orient the active 3D view: iso, iso_left, iso_bottom, front, back, top, bottom, left, right, home."""
-    v = s.app.ActiveView
+    v = s.view()
     if v is None:
         raise InventorError("no active view")
     cam = v.Camera
@@ -459,7 +487,7 @@ def screenshot(s: Session, path: str = "", view: str = "", width: int = 1600, he
     """
     if view:
         set_view(s, view=view)
-    v = s.app.ActiveView
+    v = s.view()
     if v is None:
         raise InventorError("no active view to capture")
     if not path:

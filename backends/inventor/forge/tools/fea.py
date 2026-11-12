@@ -44,6 +44,9 @@ def _bring_to_front(s: Session) -> None:
     import win32api
     import win32con
     import win32gui
+    ready, why = U.mouse_ready()
+    if not ready:
+        raise InventorError(f"can't bring Inventor to the front: {why}")
     h = s.app.MainFrameHWND
     if win32gui.IsIconic(h):
         win32gui.ShowWindow(h, win32con.SW_RESTORE)
@@ -60,6 +63,9 @@ def _click_screen(x: int, y: int, pid: int, what: str) -> None:
     import win32api
     import win32con
     import win32gui
+    ready, why = U.mouse_ready()
+    if not ready:
+        raise InventorError(f"cannot click {what}: {why}. Nothing was clicked")
     under = win32gui.WindowFromPoint((x, y))
     if not _owned_by_inventor(under, pid):
         raise InventorError(f"cannot click {what}: another window covers Inventor at that spot — bring Inventor "
@@ -74,6 +80,9 @@ def _click_screen(x: int, y: int, pid: int, what: str) -> None:
         if win32api.GetCursorPos() == (x, y):
             break
     else:
+        ready, why = U.mouse_ready()
+        if not ready:
+            raise InventorError(f"cannot click {what}: {why}")
         raise InventorError(f"cannot click {what}: the mouse keeps moving — someone is using it. Stopped; rerun when "
                             "the mouse can be left alone")
     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
@@ -109,13 +118,22 @@ def _type_into(c: U.Ctrl, text: str, pid: int) -> None:
     time.sleep(0.3)
 
 
+def _leading(text) -> bool:
+    return U._leading_number(text) is not None
+
+
 def _set_value(dlg: int, c: U.Ctrl, text: str, pid: int, allow_typing: bool = True) -> None:
     """Enter a value and confirm the box took it. Done with window messages and a real focus change (typed
     keys are sometimes dropped); typing is only the fallback, and only where the user agreed to it."""
     _front(dlg)
     others = [o for o in U.find_all(dlg, cls="Edit") if o.hwnd != c.hwnd and o.enabled]
     other = others[0] if others else U.find(dlg, cid=2)
-    if U.same_value(U.commit_text(c, text, other), text):
+    shown = U.commit_text(c, text, other)
+    if U.same_value(shown, text) and shown.strip() == str(text).strip() and _leading(text):
+        # shown exactly as entered: Inventor reformats a value it has parsed (12.5 -> 12.500 N), so this one may
+        # not have been taken yet; give it one more real focus change before trusting it
+        shown = U.commit_text(c, text, other)
+    if U.same_value(shown, text):
         return
     if not allow_typing:
         raise InventorError(f"Inventor did not accept the value {text!r}")
@@ -236,7 +254,7 @@ def _look_at_face(s: Session, face, at=None) -> None:
         if hit is None or hit:
             chosen = d
             break
-    v = s.app.ActiveView
+    v = s.view()
     cam = v.Camera
     cam.Perspective = False
     cam.Target = s.tg.CreatePoint(x0, y0, z0)
@@ -261,7 +279,7 @@ def _render_samples(s: Session) -> list[tuple[int, int, int]]:
     import struct
     import tempfile
     path = os.path.join(tempfile.gettempdir(), "inventor_forge_pick.bmp")
-    s.app.ActiveView.SaveAsBitmap(path, 101, 61)
+    s.view().SaveAsBitmap(path, 101, 61)
     with open(path, "rb") as f:
         data = f.read()
     off = struct.unpack_from("<I", data, 10)[0]
@@ -281,7 +299,7 @@ def _render_samples(s: Session) -> list[tuple[int, int, int]]:
 def _screen_samples(s: Session) -> list[tuple[int, int, int]]:
     """Colours at the same points as actually shown on screen."""
     import win32gui
-    hwnd = s.app.ActiveView.HWND
+    hwnd = s.view().HWND
     left, top, right, bottom = win32gui.GetClientRect(hwnd)
     w, h = right - left, bottom - top
     cx, cy = win32gui.ClientToScreen(hwnd, (w // 2, h // 2))
@@ -342,9 +360,9 @@ def _pick_face(s: Session, face, pid: int, dlg: int, attempts: int = 4) -> None:
     first = None                                     # the face as it looked before any click
     for attempt in range(attempts):
         _look_at_face(s, face)
-        safe(lambda: s.app.ActiveView.Update())
+        safe(lambda: s.view().Update())
         # Inventor only repaints once the mouse is over the viewport: without this the click lands on the old view
-        hwnd = s.app.ActiveView.HWND
+        hwnd = s.view().HWND
         left, top, right, bottom = win32gui.GetClientRect(hwnd)
         win32api.SetCursorPos(win32gui.ClientToScreen(hwnd, (left + 40, top + 40)))
         time.sleep(0.25)
@@ -359,7 +377,7 @@ def _pick_face(s: Session, face, pid: int, dlg: int, attempts: int = 4) -> None:
         # with the original view, not "is it vivid", so a red or orange part can't fake a selection)
         if attempt and sum(1 for a, b in zip(first, before) if not _close(a, b, 45)) >= 3:
             return
-        hwnd = s.app.ActiveView.HWND
+        hwnd = s.view().HWND
         left, top, right, bottom = win32gui.GetClientRect(hwnd)
         cx, cy = win32gui.ClientToScreen(hwnd, ((right - left) // 2, (bottom - top) // 2))
         under = win32gui.WindowFromPoint((cx, cy))
@@ -414,7 +432,7 @@ def _set_view(s: Session, d, pts) -> tuple:
     xs = [sum((p[i] - target[i]) * right[i] for i in range(3)) for p in pts]
     ys = [sum((p[i] - target[i]) * up[i] for i in range(3)) for p in pts]
     span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0) * 1.6 + 2.0
-    v = s.app.ActiveView
+    v = s.view()
     cam = v.Camera
     cam.Perspective = False
     safe(lambda: cam.SetExtents(span, span))          # zoom first: setting it later re-centres the camera
@@ -469,7 +487,7 @@ def _pick_faces(s: Session, faces: list, pid: int, dlg: int) -> None:
         return
     d, pts = view
     to_px = _set_view(s, d, pts)
-    hwnd = s.app.ActiveView.HWND
+    hwnd = s.view().HWND
     dl, dt, dr, _db = win32gui.GetWindowRect(dlg)
     park = ((dl + dr) // 2, dt + 12)
     left, top, _r, _b = win32gui.GetClientRect(hwnd)
@@ -510,6 +528,7 @@ def _pick_faces(s: Session, faces: list, pid: int, dlg: int) -> None:
 
 # --------------------------------------------------------------------------- command + dialog steps
 def _run_command(s: Session, name: str) -> None:
+    s.front()                                          # commands act on the active document
     s.app.CommandManager.ControlDefinitions.Item(name).Execute2(False)
 
 
@@ -575,7 +594,7 @@ def _enter_analysis(s: Session) -> None:
     if env is None:
         raise InventorError("Inventor's Stress Analysis environment isn't available (it needs Inventor Professional "
                             "and its Stress Analysis add-in)")
-    s.doc().EnvironmentManager.SetCurrentEnvironment(env)
+    s.front().EnvironmentManager.SetCurrentEnvironment(env)
     time.sleep(0.8)
 
 
@@ -815,7 +834,15 @@ def _simulate(s: Session, pid: int, timeout: float = 3600.0, front: bool = True)
             raise InventorError(f"the solve is still running after {timeout:.0f} s; leave Inventor alone until it ends")
         time.sleep(0.5)
     time.sleep(1.0)
+    fatal = [w for w in warnings if any(k in w.lower() for k in FATAL_SOLVE)]
+    if fatal:
+        raise InventorError("the solve reported a broken mesh, so its results can't be used: " + "; ".join(fatal[:3]) +
+                            ". Only the solver finds these (meshing alone passes); look for slivers, tiny faces or "
+                            "near-tangent contacts, or change the element size")
     return time.time() - t0, warnings
+
+
+FATAL_SOLVE = ("degenerate element", "negative jacobian", "distorted element")
 
 
 def _answer_results_prompt(pid: int) -> int:
@@ -1282,7 +1309,7 @@ def analyze_stress(s: Session, fixed_faces: list | None = None, loads: list[dict
     png = os.path.join(s.workdir, "renders", f"{tag}_von_mises.png")
     os.makedirs(os.path.dirname(png), exist_ok=True)
     safe(lambda: _iso_result_view(s))
-    safe(lambda: s.app.ActiveView.SaveAsBitmap(png, 1600, 1000))
+    safe(lambda: s.view().SaveAsBitmap(png, 1600, 1000))
     if os.path.exists(png):
         out["path"] = png
     out["note"] = ("Inventor's default mesh is coarse; rerun with mesh_fraction=0.05 and compare the peak to "
@@ -1291,7 +1318,7 @@ def analyze_stress(s: Session, fixed_faces: list | None = None, loads: list[dict
 
 
 def _iso_result_view(s: Session) -> None:
-    cam = s.app.ActiveView.Camera
+    cam = s.view().Camera
     cam.ViewOrientationType = K.kIsoTopRightViewOrientation
     cam.Fit()
     cam.ApplyWithoutTransition()

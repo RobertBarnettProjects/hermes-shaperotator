@@ -145,6 +145,20 @@ def _choose_scale(sizes, area_w, area_h):
     return SCALES[-1]
 
 
+LABEL = {"AS1100": "AS 1100", "ISO": "ISO 128", "ASME": "ASME Y14.5", "DIN": "DIN EN ISO 128", "BS8888": "BS 8888",
+         "JIS": "JIS B 0001", "GB": "GB/T 4457"}
+THIRD_ANGLE = {"AS1100", "ASME", "JIS"}
+_ALIASES = {"AS": "AS1100", "ANSI": "ASME", "BS": "BS8888", "BSI": "BS8888", "GBT": "GB"}
+
+
+def standard_key(standard) -> str:
+    k = str(standard or "AS1100").upper().replace(" ", "").replace("-", "").replace("/", "").replace("_", "")
+    k = _ALIASES.get(k, k)
+    if k not in LABEL:
+        raise DrawingError(f"standard must be one of {list(LABEL)}")
+    return k
+
+
 class Sheet:
     def __init__(self, standard="AS1100", sheet_size="A3", orientation="landscape", properties=None):
         if sheet_size not in SHEETS:
@@ -154,7 +168,8 @@ class Sheet:
             w, h = h, w
         self.W, self.H = w, h
         self.size = sheet_size
-        self.standard = "ISO" if str(standard).upper().startswith("ISO") else "AS1100"
+        self.standard = standard_key(standard)
+        self.third = self.standard in THIRD_ANGLE
         self.props = dict(properties or {})
         self.views = {}
         self.dims = []          # dicts: kind, view, p1, p2, offset_dir, text
@@ -189,7 +204,7 @@ class Sheet:
         # front view origin (paper mm, lower-left of the view's bbox)
         x0 = BORDER + 12 + DIM_GAP + 2 * DIM_STEP
         y0 = BORDER + TB_H + 12 + DIM_GAP + 2 * DIM_STEP
-        third = self.standard == "AS1100"
+        third = self.third
         pos = {}
         if third:
             pos["front"] = (x0, y0)
@@ -362,7 +377,7 @@ class Sheet:
         return x1, y1, x2, y2
 
     def summary(self):
-        return {"standard": self.standard, "projection": "third angle" if self.standard == "AS1100" else "first angle",
+        return {"standard": self.standard, "projection": "third angle" if self.third else "first angle",
                 "sheet": f"{self.size} {self.W:g}x{self.H:g}", "scale": f"{self.scale[0]:g}:{self.scale[1]:g}",
                 "views": list(self.views), "dimensions": [f"{d['what']}: {d['value']:.1f}" for d in self.dims],
                 "hole_callouts": [n["text"] for n in self.notes]}
@@ -485,7 +500,7 @@ class Sheet:
             ("DRAWING No.", p.get("drawing_number", ""), 1), ("SHEET", f"{p.get('sheet', '1 OF 1')}", 1),
             ("MATERIAL", p.get("material", ""), 1), ("SCALE", f"{self.scale[0]:g}:{self.scale[1]:g}", 1),
             ("DRAWN", p.get("drawn_by", ""), 1), ("DATE", p.get("date", _dt.date.today().isoformat()), 1),
-            ("UNITS", "mm", 1), ("STANDARD", "AS 1100" if self.standard == "AS1100" else "ISO 128", 1),
+            ("UNITS", "mm", 1), ("STANDARD", LABEL[self.standard], 1),
         ]
         # layout: title across the top, then a 2-column grid
         h_title = 14
@@ -503,7 +518,7 @@ class Sheet:
         sx, sy = x0 + TB_W - 30, y0
         ax.add_patch(Rectangle((sx, sy), 30, TB_H - h_title, fill=False, lw=lw))
         cx, cy = sx + 15, sy + (TB_H - h_title) / 2
-        third = self.standard == "AS1100"
+        third = self.third
         # the cone's narrow end always faces the end view (circles); third angle: cone left, circles right
         cone_x = cx - 9 if third else cx + 3
         circ_x = cx + 7 if third else cx - 7

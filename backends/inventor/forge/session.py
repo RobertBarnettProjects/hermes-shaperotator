@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from .com import CM2_TO_MM2, CM3_TO_MM3, MM, InventorError, K, items, safe
+from .com import CM2_TO_MM2, CM3_TO_MM3, MM, InventorError, K, items, late, safe
 
 # DocumentTypeEnum values are looked up lazily through K, these are just names
 DOC_KIND = {"kPartDocumentObject": "part", "kAssemblyDocumentObject": "assembly",
@@ -33,6 +33,13 @@ class Session:
         self.pid: int | None = None            # Inventor's process id, once connected
         self.private = False                   # True when this session started its own Inventor process
         self.workdir = os.path.join(os.path.expanduser("~"), "Documents", "inventor-forge")
+        self.standard: str | None = None       # chosen by the user for this session (set_standard); None = not asked yet
+        self.drawing_units = "mm"
+
+    def standard_key(self, standard: str = "") -> str:
+        """The standard a call should follow: the one it names, else the session's choice, else AS 1100."""
+        from .standards import DEFAULT, key
+        return key(standard) if standard else (self.standard or DEFAULT)
 
     # ------------------------------------------------------------------ connection
     @property
@@ -52,12 +59,11 @@ class Session:
 
     def _connect(self):
         import win32com.client as wc
-        import win32com.client.dynamic as dyn
         try:
             raw = wc.GetActiveObject("Inventor.Application")
         except Exception:
             raw = wc.DispatchEx("Inventor.Application")
-        app = dyn.Dispatch(raw._oleobj_)          # always late-bound: predictable across machines
+        app = late(raw)          # always late-bound, method results included: predictable across machines
         try:
             if self.visible and not app.Visible:
                 app.Visible = True
@@ -77,7 +83,6 @@ class Session:
         import time
 
         import win32com.client as wc
-        import win32com.client.dynamic as dyn
 
         from .uidrive import pids_named
         if self.private and self._app is not None:
@@ -88,7 +93,7 @@ class Session:
         while not set(pids_named("Inventor.exe")) - before and time.time() - t0 < 120:
             time.sleep(0.5)
         new = set(pids_named("Inventor.exe")) - before
-        app = dyn.Dispatch(raw._oleobj_)
+        app = late(raw)
         pid = self._process_id(app) if new else None
         if pid not in new:
             raise InventorError("could not start a separate Inventor (no new process appeared); nothing was touched")
@@ -109,6 +114,7 @@ class Session:
         year = str(safe(lambda: self.app.SoftwareVersion.DisplayVersion, ""))[:4]
         root = r"C:\Users\Public\Documents\Autodesk"
         found = glob.glob(os.path.join(root, f"Inventor {year}", "Templates", "*", "Metric", filename))
+        found += glob.glob(os.path.join(root, f"Inventor {year}", "Templates", "*", "English", filename))
         found.sort(key=lambda p: 0 if os.sep + "en-US" + os.sep in p else 1)
         return found[0] if found else ""
 
@@ -118,31 +124,61 @@ class Session:
     # ------------------------------------------------------------------ documents
     def set_current(self, d) -> None:
         """The document this session is working on (created, opened or activated through a tool)."""
+        d = late(d)
         self._current = d
         self._current_key = self.key(d) if d is not None else None
 
-    def doc(self):
-        """The session's working document — brought back to the front if something else (the user,
-        another document opening) took focus — else Inventor's active document."""
+    def _working(self):
         cur = getattr(self, "_current", None)
-        if cur is not None:
-            try:
-                alive = self.key(cur) == self._current_key and cur.Views.Count >= 0
-            except Exception:
-                alive = False
-            if alive:
-                act = self.app.ActiveDocument
-                if act is None or self.key(act) != self._current_key:
-                    try:
-                        cur.Activate()
-                    except Exception:
-                        pass
+        if cur is None:
+            return None
+        try:
+            if self.key(cur) == self._current_key and cur.Views.Count >= 0:
                 return cur
-            self._current = None
-        d = self.app.ActiveDocument
+        except Exception:
+            pass
+        self._current = None
+        return None
+
+    def doc(self):
+        """The session's working document, else Inventor's active document. In a private Inventor the working
+        document is also brought back to the front if something took focus; attached to the user's Inventor it is
+        left where it is (most API work doesn't need it in front). Steps that do need it, commands and the active
+        view, go through front() / view()."""
+        cur = self._working()
+        if cur is not None:
+            if self.private:
+                self._raise(cur)
+            return cur
+        d = late(self.app.ActiveDocument)
         if d is None:
             raise InventorError("no active document — create_part / create_assembly / open_document first")
         return d
+
+    def _raise(self, cur) -> bool:
+        act = self.app.ActiveDocument
+        if act is None or self.key(act) != self._current_key:
+            try:
+                cur.Activate()
+                return True
+            except Exception:
+                pass
+        return False
+
+    def front(self):
+        """The working document, made Inventor's active document: for commands, selections and the active view,
+        which always act on whatever is active. In the user's Inventor this switches documents only when needed."""
+        cur = self._working()
+        if cur is None:
+            return self.doc()
+        if self._raise(cur) and not self.private:
+            self.switched_documents = getattr(self, "switched_documents", 0) + 1
+        return cur
+
+    def view(self):
+        """The active view of the working document (brought to the front first)."""
+        self.front()
+        return self.app.ActiveView
 
     def kind(self, d=None) -> str:
         d = d or self.doc()

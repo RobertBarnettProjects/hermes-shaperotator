@@ -29,7 +29,9 @@ figure in its reply that no analysis backs**.
   safety-factor and computed-mass figures written in the usual forms ("116 MPa", "SF 2.1", "0.35 mm deflection") are
   matched against the log and a footer is appended: ✅ matches · ⚠️ matches a run with warnings or failed checks ·
   ❌ contradicts the analysis · ❓ not backed by any analysis. It flags; it doesn't rewrite the reply.
-- **Drawings:** AS 1100 (third-angle) or ISO sheets with title block and projection symbol on both backends; a QA
+- **Standards, chosen per chat:** the agent asks once at the start (AS 1100, ISO, ASME, DIN, BS 8888, JIS or GB)
+  and keeps the answer for the rest of the chat; drawings, fastener and material suggestions follow it.
+- **Drawings:** sheets to the chat's standard (template, projection angle) with title block and projection symbol on both backends; a QA
   check runs on the sheet and PDF export waits for it to be clean (override once with `/cad force-export`).
 - **Inventor automation:** the Inventor backend is [inventor-forge](https://github.com/RobertBarnettProjects/inventor-forge)
   (vendored in `backends/inventor/forge`); `cad_native` reaches its 160+ tools (sheet metal and flat patterns,
@@ -69,8 +71,8 @@ Requirements:
 | Autodesk Inventor 2024+ | optional, Windows only (`pywin32` is installed with the plugin). |
 
 Settings (Desktop: **Capabilities → Plugins → hermes-shaperotator**, or `plugins.entries.hermes-shaperotator.settings` in
-`config.yaml`): `backend` (`freecad`/`inventor`), `freecad_path`, `standard` (`AS1100` third-angle / `ISO`
-first-angle), `job_dir`, `inventor_visible`.
+`config.yaml`): `backend` (`freecad`/`inventor`), `freecad_path`, `standard` (optional: fixes the standard for every chat, e.g. `AS1100`, `ISO`, `ASME`, `DIN`,
+`BS8888`, `JIS`, `GB`; leave it empty and the agent asks once per chat), `job_dir`, `inventor_visible`.
 
 ## Any CAD program: swap the MCP server
 
@@ -106,7 +108,8 @@ CAD server this way. More programs (NX first) are planned.
 | `cad_feature` | extrude/cut, revolve, hole, fillet, chamfer, circular pattern, delete — returns the delta |
 | `cad_inspect` | mass properties, edges/faces tables, find edge/face, render a PNG |
 | `cad_parameters` | get/set/add driving parameters |
-| `cad_drawing` | drawing sheets (AS 1100 / ISO), check, export PDF (gated) |
+| `cad_standard` | the chat's standard: get, list, set (asked once per chat) |
+| `cad_drawing` | drawing sheets to the chat's standard, check, export PDF (gated) |
 | `cad_transaction` | begin/commit/abort groups of operations |
 | `cad_fea` | FEA run / face table / design sweep; materials, supports, force/pressure/gravity loads |
 | `cad_python` | escape hatch: run Python inside the CAD app (**asks the user every time**) |
@@ -154,7 +157,8 @@ reported when an analysis computed one. The footer is append-only, so streaming 
   exports under the plugin data folder (or `job_dir`), plus paths you give to `save`/`export`.
 - **Modifies replies:** appends a verification footer to assistant messages that contain engineering
   figures (text only, appended — never edits what the model wrote).
-- Configured MCP commands launch child processes with your permissions and inherited environment plus configured overrides. Those children can access networks and credentials available to them. The pane polls the plugin's backend route for scene data. Live sync polls Inventor for model changes. PDF report generation launches a local Chrome or Edge browser in headless mode.
+- Configured MCP commands launch child processes with your permissions. They get a minimal environment (what the OS needs) plus the server's own `env` from config, not Hermes's provider keys; the same goes for the FreeCAD worker and the headless browser. MCP servers are read only from the plugin's `mcp_servers` config.
+- Files the model writes go to the session's job folder. Paths are taken literally (no `~` or `$VAR` expansion, `..` refused, symlinks resolved); a write that lands outside the job folder asks you first in Hermes's approval prompt, naming the resolved path. The pane polls the plugin's backend route for scene data. Live sync polls Inventor for model changes. PDF report generation launches a local Chrome or Edge browser in headless mode.
 
 ## Limits (honest)
 
