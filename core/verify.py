@@ -15,21 +15,24 @@ from .evidence import EVIDENCE, Record
 NUM = r"(\d+(?:[.,]\d+)?)"
 
 # (quantity, regex). Group "v" is the value. Context words keep e.g. "M16" or "250 mm wide" out.
+# A number starts only where no digit or point comes before it, and every run is bounded, so no pattern can rescan
+# a long run of digits, letters or spaces from each position (linear in the reply length).
+V = r"(?<![\d.])(?P<v>\d{1,12}(?:\.\d{1,12})?)"
 PATTERNS: list[tuple[str, re.Pattern]] = [
-    # every run is bounded, so a padded table row can't make these backtrack (each run is at most 12 characters)
     ("safety_factor", re.compile(
         r"(?:safety\s{1,3}factor|factor\s{1,3}of\s{1,3}safety|\bFoS\b|\bSF\b)"
         r"(?:\s{1,3}(?:on|against|vs\.?|to|for)\s{1,3}\w{1,20})?"
         r"[\s|*:=≈~]{0,12}(?:\(\w{1,20}\)[\s|*:=≈~]{0,12})?"
-        r"(?:(?:of|is|was|about|around|approximately)[\s|*:=≈~]{1,12}){0,2}(?P<v>\d+(?:\.\d+)?)", re.I)),
+        r"(?:(?:of|is|was|about|around|approximately)[\s|*:=≈~]{1,12}){0,2}" + V, re.I)),
     ("safety_factor", re.compile(
-        r"(?P<v>\d+(?:\.\d+)?)\s{0,3}(?:×|x)?\s{0,3}(?:safety\s{1,3}factor|factor\s{1,3}of\s{1,3}safety)", re.I)),
-    ("stress_MPa", re.compile(r"(?P<v>\d+(?:\.\d+)?)\s*(?:MPa|N/mm²|N/mm2)\b", re.I)),
+        V + r"\s{0,3}(?:×|x)?\s{0,3}(?:safety\s{1,3}factor|factor\s{1,3}of\s{1,3}safety)", re.I)),
+    ("stress_MPa", re.compile(V + r"\s{0,3}(?:MPa|N/mm²|N/mm2)\b", re.I)),
     ("disp_mm", re.compile(
-        r"(?:deflect\w*|displac\w*|deform\w*|sag\w*|moves?|movement)[^.\n]{0,40}?(?P<v>\d+(?:\.\d+)?)\s*mm\b", re.I)),
+        r"\b(?:deflect\w{0,20}|displac\w{0,20}|deform\w{0,20}|sag\w{0,20}|moves?|movement)[^.\n]{0,40}?" + V + r"\s{0,3}mm\b",
+        re.I)),
     ("disp_mm", re.compile(
-        r"(?P<v>\d+(?:\.\d+)?)\s*mm\s+(?:of\s+)?(?:max(?:imum)?\s+)?(?:deflection|displacement|deformation|sag)", re.I)),
-    ("mass_kg", re.compile(r"(?P<v>\d+(?:\.\d+)?)\s*kg\b(?!\s*/)", re.I)),
+        V + r"\s{0,3}mm\s{1,3}(?:of\s{1,3})?(?:max(?:imum)?\s{1,3})?(?:deflection|displacement|deformation|sag)", re.I)),
+    ("mass_kg", re.compile(V + r"\s{0,3}kg\b(?!\s{0,3}/)", re.I)),
 ]
 
 # which evidence values can back each quantity

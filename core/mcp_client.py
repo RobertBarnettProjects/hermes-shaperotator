@@ -241,14 +241,15 @@ class McpClient:
             self._tools = out
         return self._tools
 
-    def call(self, name: str, args: dict | None = None, *, mutating: bool | None = None) -> dict:
+    def call(self, name: str, args: dict | None = None, *, mutating: bool | None = None,
+             timeout: float | None = None) -> dict:
         """Call a tool; returns its JSON result as a dict (text that isn't JSON comes back as {"text": ...})."""
         self.start()
         if mutating is None:
             mutating = not self.tools.get(name, {}).get("annotations", {}).get("readOnlyHint", False)
         if self.uncertain and mutating:
             raise McpError("Previous tools/call timed out, mutation outcome uncertain. Call connect to re-sync before further mutations.")
-        r = self.request("tools/call", {"name": name, "arguments": args or {}}, mutating=mutating)
+        r = self.request("tools/call", {"name": name, "arguments": args or {}}, timeout=timeout, mutating=mutating)
         texts = [c.get("text", "") for c in r.get("content", []) if c.get("type") == "text"]
         text = "\n".join(t for t in texts if t)
         if r.get("isError"):

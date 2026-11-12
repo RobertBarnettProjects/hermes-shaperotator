@@ -84,6 +84,8 @@ def key(standard: str) -> str:
     k = str(standard or "").upper().replace(" ", "").replace("-", "").replace("/", "").replace("_", "")
     k = ALIASES.get(k, k)
     if k not in STANDARDS:
+        k = next((key for key in sorted(STANDARDS, key=len, reverse=True) if k.startswith(key)), k)
+    if k not in STANDARDS:
         raise StandardError(f"unknown standard {standard!r}; choose one of {', '.join(STANDARDS)}")
     return k
 

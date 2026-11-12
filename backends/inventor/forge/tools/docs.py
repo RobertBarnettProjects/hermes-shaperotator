@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 
-from ..com import InventorError, K, items, safe
+from ..com import InventorError, K, items, late, plain_name, safe
 from ..registry import tool
 from ..session import Session
 
@@ -128,15 +128,21 @@ def set_active_project(s: Session, project: str, other_inventors_ok: bool = Fals
 
 @tool("session", mutates=False)
 def status(s: Session) -> dict:
-    """Active document summary (type, path, feature/sketch/body counts, volume, material)."""
+    """Summary of the document this session works on (type, path, feature/sketch/body counts, volume, material):
+    the working document, else Inventor's active one. user_active names the document the user has in front when that
+    is a different one."""
     app = s.app
-    d = app.ActiveDocument
+    work = s._working()
+    active = late(app.ActiveDocument)
+    d = work if work is not None else active
     out = {"connected": True, "version": safe(lambda: app.SoftwareVersion.DisplayVersion, "?"),
            "open_documents": safe(lambda: app.Documents.VisibleDocuments.Count, 0)}
     if d is None:
         out["active"] = None
     else:
         out["active"] = _doc_info(s, d)
+        if work is not None and active is not None and s.key(active) != s.key(work):
+            out["user_active"] = safe(lambda: active.DisplayName, "")
     return out
 
 
@@ -294,7 +300,7 @@ def save_document(s: Session, path: str = "") -> dict:
             raise
     else:
         if not safe(lambda: d.FullFileName, ""):
-            name = safe(lambda: d.DisplayName, "Untitled").split(".")[0]
+            name = plain_name(safe(lambda: d.DisplayName, "Untitled").split(".")[0], "Untitled")
             return save_document(s, os.path.join(s.workdir, name))
         d.Save()
     return {"saved": safe(lambda: d.FullFileName, path)}
@@ -306,7 +312,8 @@ def close_document(s: Session, save: bool = False, name: str = "") -> dict:
     d = _find_doc(s, name) if name else s.doc()
     label = safe(lambda: d.DisplayName, "")
     if save:
-        save_document(s) if d is s.app.ActiveDocument else d.Save()
+        active = s.app.ActiveDocument
+        save_document(s) if active is not None and s.key(d) == s.key(active) else d.Save()
     if getattr(s, "_current", None) is not None and s.key(d) == getattr(s, "_current_key", None):
         s.set_current(None)
     d.Close(not save)          # SkipSave
@@ -528,8 +535,9 @@ def transaction(s: Session, action: str = "begin", name: str = "forge") -> dict:
 
 @tool("session")
 def undo(s: Session, steps: int = 1) -> dict:
-    """Undo the last N operations in the active document."""
+    """Undo the last N operations in the working document."""
     before = s.snapshot()
+    s.front()                          # TransactionManager undoes in whatever document is active: make it ours
     tm = s.app.TransactionManager
     done = 0
     for _ in range(max(1, int(steps))):
@@ -566,7 +574,8 @@ def close_unused_documents(s: Session) -> dict:
 def model_version(s: Session) -> dict:
     """A cheap fingerprint of the active document's geometry, for noticing edits made by hand in Inventor (it changes
     whenever the model's shape changes)."""
-    d = s.app.ActiveDocument
+    d = s._working()
+    d = d if d is not None else late(s.app.ActiveDocument)
     if d is None:
         return {"document": None, "version": ""}
     ver = safe(lambda: d.ModelGeometryVersion, "") or ""

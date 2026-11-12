@@ -745,10 +745,10 @@ def op_drawing_new(standard="AS1100", sheet_size="A3", orientation="landscape", 
 
 
 def op_drawing_part_sheet(model_path="", views="front,top,right,iso", scale=0, sheet_size="A3", up="z",
-                          new_sheet=False, title=""):
+                          new_sheet=False, title="", standard="AS1100"):
     d = _drawing_mod()
-    if _DRAWING["sheet"] is None or new_sheet:
-        op_drawing_new(sheet_size=sheet_size)
+    if _DRAWING["sheet"] is None or new_sheet:            # a sheet made by an explicit `new` keeps its own standard
+        op_drawing_new(standard=standard, sheet_size=sheet_size)
     sheet = _DRAWING["sheet"]
     if model_path:
         if not os.path.isfile(model_path):

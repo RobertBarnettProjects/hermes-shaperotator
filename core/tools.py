@@ -119,7 +119,7 @@ def cad_backend(args: dict, **_: Any) -> str:
 def cad_document(args: dict, **_: Any) -> str:
     a = args["action"]
     if a == "new_part":
-        return _ok(**_call("new_part", name=args.get("name", "Part")))
+        return _ok(**_call("new_part", name=_paths.safe_name(args.get("name") or "Part", "Part")))
     if a == "new_assembly":
         return _ok(**_call("new_assembly"))
     if a == "open":
@@ -209,7 +209,7 @@ def cad_inspect(args: dict, **_: Any) -> str:
         return _ok(**_call("find_face", tolerance=args.get("tolerance", 0.5), min_area=args.get("min_area", 100), **xyz))
     if w == "render":
         view = args.get("view", "iso")
-        path = _path(None, f"preview-{view}.png")
+        path = _path(None, f"preview-{_paths.safe_name(view, 'view')}.png")
         r = _call("render", path=path, view=view)
         STATE.last_preview = r.get("path", path)
         return _ok(**r, hint="Open the PNG (read the image) to check the model visually.")
@@ -241,11 +241,21 @@ def cad_drawing(args: dict, **_: Any) -> str:
         std = _std.for_call(g("standard") or "")
         if not std:
             return _err(_std.ASK)
-        r = _call("drawing_new", standard=std, drawing_units=(_std.chosen() or {}).get("drawing_units", "mm"),
+        units = (_std.chosen() or {}).get("drawing_units", "mm") if not g("standard") else "mm"
+        if units == "in" and STATE.family == "freecad":
+            return _err("inch drawings need the Inventor backend (FreeCAD sheets are metric); use mm or cad_backend inventor")
+        extra = {"drawing_units": units} if STATE.family in ("inventor", "freecad") else {}
+        r = _call("drawing_new", standard=std, **extra,
                   sheet_size=g("sheet_size", "A3"), orientation=g("orientation", "landscape"),
                   properties=g("properties") or {})
     elif a == "part_sheet" and STATE.family == "freecad":
-        r = _call("drawing_part_sheet", model_path=_path(g("model_path"), "") if g("model_path") else "",
+        from . import standard as _std
+        std = _std.for_call(g("standard") or "")
+        if not std:
+            return _err(_std.ASK)
+        if (_std.chosen() or {}).get("drawing_units") == "in" and not g("standard"):
+            return _err("inch drawings need the Inventor backend (FreeCAD sheets are metric)")
+        r = _call("drawing_part_sheet", standard=std, model_path=_path(g("model_path"), "") if g("model_path") else "",
                   views=g("views", "front,top,right,iso"), scale=g("scale", 0), sheet_size=g("sheet_size", "A3"),
                   new_sheet=bool(g("new_sheet", False)))
         if g("properties"):
@@ -261,8 +271,9 @@ def cad_drawing(args: dict, **_: Any) -> str:
         std = _std.for_call(g("standard") or "")
         if not std:
             return _err(_std.ASK)
-        r = _call(f"drawing_{a}", model_path=_path(args["model_path"], ""), views=g("views", "front,top,right,iso"),
-                  standard=std,
+        extra = ({"standard": std, "drawing_units": (_std.chosen() or {}).get("drawing_units", "mm")}
+                 if STATE.family == "inventor" else {})
+        r = _call(f"drawing_{a}", model_path=_path(args["model_path"], ""), views=g("views", "front,top,right,iso"), **extra,
                   scale=g("scale", 0), sheet_size=g("sheet_size", "A3"), up=g("up", "z"),
                   new_sheet=bool(g("new_sheet", False)))
     elif a == "check":
@@ -551,8 +562,12 @@ def cad_native(args: dict, **_: Any) -> str:
     if tool in ("analyze_stress", "analyze_modes", "result_at_point") or (tool == "study_report" and targs.get("only_this_study")):
         # the pre_tool_call hook showed the mouse/keyboard notice in Hermes's approval prompt and the user approved
         targs["user_notified"] = True
+    for key in _paths.NATIVE_NAMES.get(tool, ()):
+        if isinstance(targs.get(key), str) and targs[key]:
+            targs[key] = _paths.safe_name(targs[key])        # these become file names inside Inventor's workdir
     for key, value in _paths.written_args("cad_native", {"tool": tool, "args": targs}):
-        targs[key] = str(_paths.resolve(value))     # outside the job folders only after the user approved it
+        if key in targs and _paths.PATH_KEY.search(key):   # top-level path arguments are resolved, so the server gets a real path
+            targs[key] = str(_paths.resolve(value))  # outside the job folders only after the user approved it
     r = _call("native", tool=tool, args=targs)
     if tool == "analyze_stress":
         r = _native_fea_evidence(targs, r)

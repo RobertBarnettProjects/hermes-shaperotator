@@ -21,7 +21,7 @@ import shutil
 import time
 
 from .. import uidrive as U
-from ..com import InventorError, K, items, r, safe, typed_call
+from ..com import InventorError, K, items, r, safe, typed_call, plain_name
 from ..registry import tool
 from ..session import Session
 from .inspect import face_centroid, face_normal, find_planar_face
@@ -923,7 +923,7 @@ def _report(s: Session, pid: int, name: str, timeout: float = 1800.0, front: boo
         except InventorError:
             if time.time() - t0 > 180:
                 raise
-    U.set_text(U.find(h, cid=10110), name)             # file name (a plain edit box)
+    U.set_text(U.find(h, cid=10110), plain_name(name, "report"))      # file name (a plain edit box)
     if only_study:
         _tick_only_study(s, pid, h, only_study)
     started = time.time()
@@ -1176,7 +1176,7 @@ def analyze_stress(s: Session, fixed_faces: list | None = None, loads: list[dict
     is_asm = s.kind() == "assembly"
     pid = _pid(s)
     applied = [0.0, 0.0, 0.0]
-    tag = name or f"forge_{time.strftime('%H%M%S')}"
+    tag = plain_name(name, "") or f"forge_{time.strftime('%H%M%S')}"
     t0 = time.time()
     _bring_to_front(s)
     _enter_analysis(s)
@@ -1338,7 +1338,7 @@ def analyze_modes(s: Session, fixed_faces: list, modes: int = 6, name: str = "",
     _check_ready(s)
     fixed = [face_ref(s, i) for i in fixed_faces]
     pid = _pid(s)
-    tag = name or f"forge_modal_{time.strftime('%H%M%S')}"
+    tag = plain_name(name, "") or f"forge_modal_{time.strftime('%H%M%S')}"
     _bring_to_front(s)
     _enter_analysis(s)
     _create_study(s, pid, modal_modes=int(modes), study_name=study_name)

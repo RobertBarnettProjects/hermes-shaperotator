@@ -62,7 +62,8 @@ def execute_python(s: Session, code: str) -> dict:
     Use it for anything the dedicated tools don't cover.
     """
     app = s.app
-    doc = app.ActiveDocument
+    # the session's working document (brought to the front, so code using app.ActiveDocument agrees), else the active one
+    doc = s.front() if s._working() is not None else late(app.ActiveDocument)
     cdef = None
     if doc is not None:
         try:

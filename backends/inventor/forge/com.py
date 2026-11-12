@@ -230,6 +230,15 @@ def typed_call(obj, method: str, *args):
     raise InventorError(f"{method} not found on {ti.GetDocumentation(-1)[0]}")
 
 
+def plain_name(name: str, default: str = "untitled", limit: int = 80) -> str:
+    """A name that becomes part of a file name, reduced to a plain file name: no folders, drive, '..' or odd
+    characters (so a study called "C:\\x" or "..\\..\\x" can't put a picture or report outside the workdir)."""
+    import re
+    base = re.split(r"[\\/:]", str(name or ""))[-1]
+    base = re.sub(r"[^\w .()+-]", "_", base).strip(" .")
+    return (base or default)[:limit]
+
+
 def safe(fn: Callable[[], Any], default: Any = None) -> Any:
     try:
         return fn()

@@ -135,3 +135,53 @@ def test_long_reply_is_capped():
 ])
 def test_safety_factor_still_found(text, value):
     assert [c.value for c in verify.extract(text) if c.quantity == "safety_factor"] == [value]
+
+
+# --------------------------------------------------------------------------- review 4 (Fable 5.2, Sol 6.1)
+@pytest.mark.parametrize("text", ["1" * 20000, "sag" * 6666, "deflect" * 2857, "1" * 10000 + " " * 10000,
+                                  "9" * 10000, "1." * 10000])
+def test_no_pattern_backtracks_on_long_runs(text):
+    t0 = time.perf_counter()
+    verify.extract(text)
+    assert time.perf_counter() - t0 < 0.5
+
+
+def test_snapshot_and_preview_names_stay_plain():
+    assert paths.safe_name(r"C:\Users\Public\x") == "x"
+    assert paths.safe_name(r"..\..\x") == "x"
+    assert paths.safe_name("x/../../../escaped") == "escaped"
+
+
+def test_sibling_job_folders_need_approval(job):
+    sibling = job.parent / "older" / "model.stp"
+    out = P._pre_tool_call(tool_name="cad_document", args={"action": "export", "path": str(sibling)})
+    assert out and out["action"] == "approve"
+
+
+def test_server_specific_argument_names_are_checked(job, tmp_path):
+    for args in ({"destination": str(tmp_path / ".env")}, {"filePath": str(tmp_path / "k")},
+                 {"outputPath": str(tmp_path / "k")}, {"anything": str(tmp_path / "k")}, {"anything": "~/.bashrc"}):
+        out = P._pre_tool_call(tool_name="cad_native", args={"tool": "save_file", "args": args})
+        assert out and out["action"] == "approve", args
+
+
+def test_expressions_are_not_paths(job):
+    assert P._pre_tool_call(tool_name="cad_native",
+                            args={"tool": "set_parameter", "args": {"name": "d2", "expression": "d1/2"}}) is None
+
+
+def test_implicit_save_of_an_outside_file_needs_approval(job, monkeypatch):
+    monkeypatch.setattr(paths, "open_document_path", lambda: r"C:\Users\someone\customer.ipt")
+    for name, args in (("cad_document", {"action": "save"}), ("cad_document", {"action": "close", "save": True}),
+                       ("cad_native", {"tool": "save_document", "args": {}})):
+        out = P._pre_tool_call(tool_name=name, args=args)
+        assert out and out["action"] == "approve" and "customer.ipt" in out["message"], name
+    monkeypatch.setattr(paths, "open_document_path", lambda: str(job / "model.ipt"))
+    assert P._pre_tool_call(tool_name="cad_document", args={"action": "save"}) is None
+
+
+def test_nested_and_listed_paths_are_checked(job, tmp_path):
+    for args in ({"export": {"path": str(tmp_path / "x.step")}}, {"files": [str(tmp_path / "a"), "b"]},
+                 {"jobs": [{"out": "~/x"}]}):
+        out = P._pre_tool_call(tool_name="cad_native", args={"tool": "batch_export", "args": args})
+        assert out and out["action"] == "approve", args

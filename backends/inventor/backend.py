@@ -31,7 +31,12 @@ class _McpForge:
         if name == "connect":
             self.client.start()
             self.client.wait_for_pending_calls()
-        result = self.client.call(name, args, mutating=False if name == "connect" else (spec.mutates if spec else None))
+        wait = None
+        if spec is not None:
+            from .forge.engine import call_budget
+            wait = max(self.client.timeout, call_budget(spec.fn, args, self.client.timeout))
+        result = self.client.call(name, args, mutating=False if name == "connect" else (spec.mutates if spec else None),
+                                  timeout=wait)
         if name == "connect":
             self.client.call("status", {}, mutating=False)
             self.client.uncertain = False
@@ -85,6 +90,11 @@ class InventorBackend(CadBackend):
         if self._forge is None:
             from .forge.engine import Forge
             self._forge = Forge(visible=bool(self.settings.get("inventor_visible", True)))
+            try:
+                from ...core.state import STATE
+                self._forge.session.workdir = str(STATE.jobs())    # pictures, reports, case files: the job folder
+            except Exception:
+                pass
         return self._forge
 
     def tool_names(self) -> list[str]:
@@ -219,6 +229,8 @@ class InventorBackend(CadBackend):
         if op == "drawing_set_properties":
             r = f("set_title_block_field", fields=k.get("properties") or {})
             return {"properties": r.get("set", {}), **r}
+        if op in ("drawing_part_sheet", "drawing_assembly_sheet") and k.get("standard"):
+            f("set_standard", standard=k["standard"], drawing_units=k.get("drawing_units") or "mm")
         if op == "drawing_part_sheet":
             return f("make_part_sheet", model=k.get("model_path", ""), views=k.get("views", "front,top,right,iso"),
                      scale=float(k.get("scale") or 0), sheet_size=k.get("sheet_size", "A3"),

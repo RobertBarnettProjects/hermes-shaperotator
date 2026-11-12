@@ -230,17 +230,35 @@ def _inserted(before: list[tuple[str, str]], after: list[tuple[str, str]]) -> li
     from before the copy mean nothing afterwards; values still do. The parameters that were there before are matched
     into the new list by value, in order, lowest numbers first, so the template keeps the lowest-numbered set; every
     parameter left over belongs to the copy (sometimes two sets of it: a copy can briefly hold a transient set too)."""
-    i, extra = 0, []
-    for name, value in after:
-        if i < len(before) and U.same_value(value, before[i][1]):
+    i, extra, last_matched = 0, [], -1
+    for k, (name, value) in enumerate(after):
+        if i < len(before) and _same_param(value, before[i][1]):
             i += 1
+            last_matched = k
         else:
-            extra.append(name)
+            extra.append((k, name))
     if i != len(before):
         raise InventorError("could not match the study parameters from before the copy against the ones after it "
                             f"({i} of {len(before)} matched by value); the copy's load parameters are unknown, so "
                             "nothing was written. Save, reopen the file and try again")
-    return extra
+    if extra and extra[0][0] < last_matched:
+        # Inventor adds a copy's parameters after all the others. Left-overs in between mean the values can't tell
+        # whose is whose (another study holds near-identical loads), and guessing could write into that study.
+        raise InventorError("the copy's load parameters can't be told apart from another study's (they sit between "
+                            "existing parameters and match by value); nothing was written. Give the template distinct "
+                            "load values or delete unused studies, then try again")
+    return [n for _, n in extra]
+
+
+def _same_param(a: str, b: str) -> bool:
+    """Same parameter value, allowing only Inventor's display rounding (3 decimals): 100 is not 100.05."""
+    x, y = U._leading_number(a), U._leading_number(b)
+    if x is None or y is None:
+        return str(a).strip().lower() == str(b).strip().lower()
+    ua, ub = U._unit(a), U._unit(b)
+    if ua and ub and ua.replace(" ", "") != ub.replace(" ", ""):
+        return False
+    return abs(x - y) <= 5e-4 + 1e-9 * abs(y)
 
 
 def _copy(s: Session, pid: int, source: str, new_name: str) -> dict:

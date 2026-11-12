@@ -734,7 +734,8 @@ def snapshot_save(name: str = "") -> dict:
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = _store("artifacts")
     out.mkdir(exist_ok=True)
-    z = out / f"{name or 'snapshot'}-{stamp}.hcad.zip"
+    from .paths import safe_name
+    z = out / f"{safe_name(name, 'snapshot')}-{stamp}.hcad.zip"
     if _inventor():
         try:
             if model_info().get("path"):

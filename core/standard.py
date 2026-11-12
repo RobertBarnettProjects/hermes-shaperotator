@@ -65,7 +65,9 @@ def choose(standard: str, drawing_units: str = "mm", session_id: str | None = No
         data[sid] = {"standard": k, "drawing_units": u}
         if len(data) > 500:                      # keep the file small: oldest chats drop off
             data = dict(list(data.items())[-500:])
-        _file().write_text(json.dumps(data, indent=1), encoding="utf-8")
+        tmp = _file().with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        tmp.replace(_file())                     # atomic: a crash mid-write can't lose every chat's choice
     return data[sid]
 
 

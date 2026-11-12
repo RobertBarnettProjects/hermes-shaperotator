@@ -114,21 +114,25 @@ def create_drawing(s: Session, standard: str = "", sheet_size: str = "A3", orien
             K.kDrawingDocumentObject, K.kMetricSystemOfMeasure, K.kISO_DraftingStandard)
     except Exception:
         tpl = ""
-    d = app.Documents.Add(K.kDrawingDocumentObject, tpl, True)
+    from .docs import _dialog_watchdog, _silent
+    with _silent(s), _dialog_watchdog(s) as dog:     # some templates (GB) prompt for title-block entries: take defaults
+        d = app.Documents.Add(K.kDrawingDocumentObject, tpl, True)
+    prompts = list(getattr(dog, "cancelled", []))
     d.Activate()
     s.set_current(d)
     std = safe(lambda: d.StylesManager.ActiveStandardStyle)
-    is_as = k in ("AS1100", "ASME")              # both: decimal point, no trailing zeros (metric)
     third = spec["projection"] == "third"
+    marker = {"comma": K.kCommaDecimalMarker, "point": K.kPeriodDecimalMarker}.get(spec["decimal"])   # else the template's
     if std is not None:
         safe(lambda: setattr(std, "FirstAngleProjection", not third))
-        if is_as:       # AS 1100.101 / ASME Y14.5 metric: decimal point, no trailing zeros
+        if True:                                      # every standard: no trailing zeros (metric), inline diameters
             od = safe(lambda: std.ActiveObjectDefaults)
             for attr in ("LinearDimensionStyle", "DiameterDimensionStyle", "RadialDimensionStyle",
                          "BaselineDimensionStyle"):
                 ds = safe(lambda a=attr: getattr(od, a)) if od is not None else None
                 if ds is not None:
-                    safe(lambda ds=ds: setattr(ds, "DecimalMarkerType", K.kPeriodDecimalMarker))
+                    if marker is not None:
+                        safe(lambda ds=ds: setattr(ds, "DecimalMarkerType", marker))
                     safe(lambda ds=ds: setattr(ds, "TrailingZeroDisplay", False))
                     for attr2 in ("DiameterExternalTextOrientation", "DiameterInternalTextOrientation",
                                   "RadialTextOrientation"):
@@ -138,7 +142,11 @@ def create_drawing(s: Session, standard: str = "", sheet_size: str = "A3", orien
     if name:
         safe(lambda: setattr(d, "DisplayName", name))
     return {"drawing": d.DisplayName, "standard": standard, "template": os.path.basename(tpl) if tpl else "",
-            "projection": f"{spec['projection']}-angle", "sheet": _sheet_row(sh)}
+            "projection": f"{spec['projection']}-angle", "sheet": _sheet_row(sh),
+            **({"prompts_cancelled": prompts} if prompts else {}),
+            **({"warning": f"Inventor's {want} template isn't installed; used {os.path.basename(tpl) or 'the default'} "
+                           "with the standard's projection and dimension style"}
+               if os.path.basename(tpl or "") != want else {})}
 
 
 def _third(standard: str) -> bool:
