@@ -574,71 +574,164 @@ def auto_balloon(s: Session, view: str = "") -> dict:
     else:       # an orthographic view shows outlines best
         vs = [w for w in items(sh.DrawingViews) if "Iso" not in K.name_of(safe(lambda w=w: w.Camera.ViewOrientationType, 0), "k")
               and not str(safe(lambda w=w: w.Name, "")).upper().startswith("ISO")]       # nor a camera-aimed iso
-        v = vs[-1] if vs else sh.DrawingViews.Item(1)
+        def area(w):
+            b_ = _box(w)
+            return (b_[2] - b_[0]) * (b_[3] - b_[1])
+        v = max(vs, key=area) if vs else sh.DrawingViews.Item(1)
     md = v.ReferencedDocumentDescriptor.ReferencedDocument
     if s.kind(md) != "assembly":
         raise InventorError("auto_balloon needs an assembly view")
-    l, b, rgt, t = _box(v)
-    cx, cy = (l + rgt) / 2, (b + t) / 2
-    placed, done, taken = 0, set(), []
+    box = _box(v)
     already = _ballooned_items(sh)
-    taken += [((bb.Position.X * 10), (bb.Position.Y * 10)) for bb in items(sh.Balloons) if safe(lambda bb=bb: bb.Position)]
+    taken = [((bb.Position.X * 10), (bb.Position.Y * 10)) for bb in items(sh.Balloons) if safe(lambda bb=bb: bb.Position)]
+    # one attach point per part: the midpoint of its curve closest to the view's outline, so the leader is short
+    # and runs straight out instead of across the rest of the assembly
+    want, done = [], set()
     for occ in items(md.ComponentDefinition.Occurrences):
         fname = safe(lambda o=occ: o.Definition.Document.FullFileName, occ.Name)
         if fname in done:
             continue
-        curves = _curves(v, occ)
-        if not curves:
+        best = None
+        for c in _curves(v, occ):
+            for x, y, on in _attach_points(c):
+                d = min(x - box[0], box[2] - x, y - box[1], box[3] - y)
+                if best is None or d < best[0]:
+                    best = (d, c, x, y, on)
+        if best is None:
             continue
-        c = next((cc for cc in curves if safe(lambda cc=cc: cc.MidPoint) is not None), curves[0])
-        mp = _pt(c)
-        if mp is None:
-            continue
-        dx, dy = mp.X * 10 - cx, mp.Y * 10 - cy
-        n = math.hypot(dx, dy) or 1
-        rad = max(rgt - l, t - b) / 2 + 12
-        ang = math.atan2(dy, dx)
-        W, H = sh.Width * 10, sh.Height * 10
-        tb = safe(lambda: sh.TitleBlock.RangeBox)
-        blocked = [_lbox(o) for o in items(sh.DrawingViews) if o.Name != v.Name]
-        blocked += [(p.RangeBox.MinPoint.X * 10, p.RangeBox.MinPoint.Y * 10, p.RangeBox.MaxPoint.X * 10, p.RangeBox.MaxPoint.Y * 10)
-                    for p in items(sh.PartsLists)]
-        if tb is not None:
-            blocked.append((tb.MinPoint.X * 10, tb.MinPoint.Y * 10, tb.MaxPoint.X * 10, tb.MaxPoint.Y * 10))
+        done.add(fname)
+        want.append({"curve": best[1], "x": best[2], "y": best[3], "point": best[4]})
+    out = _place_balloons(s, sh, v, box, want, taken, already)
+    return {"balloons": out, "view": v.Name}
 
-        def spot_ok(px, py):
-            box = (px - 8, py - 8, px + 8, py + 8)
-            return (18 < px < W - 18 and 18 < py < H - 18 and not _overlap(box, (l, b, rgt, t))
-                    and not any(_overlap(box, o) for o in blocked)
-                    and all(math.hypot(px - qx, py - qy) >= BALLOON_GAP for qx, qy in taken))
 
-        bx, by = None, None
-        for ring in (0, 14, 28, 42):                  # nearest free spot around the view
-            for step in range(36):
-                sign = 1 if step % 2 else -1
-                a2 = ang + sign * (step + 1) // 2 * math.radians(10)
-                # an ellipse hugging the view's real shape, not a circle around its longest side
-                px = cx + ((rgt - l) / 2 + 14 + ring) * math.cos(a2) * 1.15
-                py = cy + ((t - b) / 2 + 14 + ring) * math.sin(a2) * 1.15
-                if spot_ok(px, py):
-                    bx, by = px, py
+def _attach_points(c):
+    """(x, y mm, exact point or None) where a leader can attach on a drawing curve: its midpoint, or for a circle
+    (which has none) the four points on its rim, so the one nearest the view's edge can be used."""
+    mp = safe(lambda: c.MidPoint)
+    if mp is not None:
+        return [(mp.X * 10, mp.Y * 10, None)]
+    cp, r = safe(lambda: c.CenterPoint), safe(lambda: c.Radius)
+    if cp is None or not r:
+        p_ = _pt(c)
+        return [(p_.X * 10, p_.Y * 10, None)] if p_ is not None else []
+    return [((cp.X + dx * r) * 10, (cp.Y + dy * r) * 10, True) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))]
+
+
+def _track(box, m):
+    x0, y0, x1, y1 = box[0] - m, box[1] - m, box[2] + m, box[3] + m
+    return x0, y0, x1, y1, 2 * (x1 - x0) + 2 * (y1 - y0)
+
+
+def _track_param(tr, x, y) -> float:
+    """Perimeter position on the track of the point straight out from (x, y) through the nearest side."""
+    x0, y0, x1, y1, _ = tr
+    w, h = x1 - x0, y1 - y0
+    side = min((y - y0, 0), (x1 - x, 1), (y1 - y, 2), (x - x0, 3))[1]
+    cx, cy = min(max(x, x0), x1), min(max(y, y0), y1)
+    return (cx - x0, w + (cy - y0), w + h + (x1 - cx), 2 * w + h + (y1 - cy))[side]
+
+
+def _track_point(tr, u):
+    x0, y0, x1, y1, per = tr
+    w, h = x1 - x0, y1 - y0
+    u %= per
+    if u < w:
+        return x0 + u, y0
+    if u < w + h:
+        return x1, y0 + (u - w)
+    if u < 2 * w + h:
+        return x1 - (u - w - h), y1
+    return x0, y1 - (u - 2 * w - h)
+
+
+def _spread(us: list[float], gap: float, per: float) -> list[float]:
+    """Keep the order of the perimeter positions and push neighbours apart until they are `gap` apart."""
+    n = len(us)
+    if n < 2 or n * gap >= per:
+        return us
+    order = sorted(range(n), key=lambda i: us[i])
+    pos = [us[i] for i in order]
+    for _ in range(400):
+        moved = False
+        for k in range(n):
+            a_, b_ = pos[k], pos[(k + 1) % n] + (per if k == n - 1 else 0)
+            d = b_ - a_
+            if d < gap - 1e-6:
+                push = (gap - d) / 2
+                pos[k] -= push
+                pos[(k + 1) % n] += push
+                moved = True
+        if not moved:
+            break
+    out = [0.0] * n
+    for k, i in enumerate(order):
+        out[i] = pos[k] % per
+    return out
+
+
+def _place_balloons(s: Session, sh, v, box, want: list[dict], taken: list, already: set) -> int:
+    """Balloons on a track around the view: each straight out from its part's outermost edge, spaced along the
+    track in the same order as their attach points, so leaders don't cross each other or run across the view."""
+    W, H = sh.Width * 10, sh.Height * 10
+    tb = safe(lambda: sh.TitleBlock.RangeBox)
+    blocked = [_lbox(o) for o in items(sh.DrawingViews) if o.Name != v.Name]
+    for o in items(sh.DrawingViews):                    # the view labels (placed later) sit centred above each view
+        ob = _box(o)
+        mid = (ob[0] + ob[2]) / 2
+        blocked.append((mid - 45, ob[3] + 1, mid + 45, ob[3] + 16))
+    blocked += [(q.RangeBox.MinPoint.X * 10, q.RangeBox.MinPoint.Y * 10, q.RangeBox.MaxPoint.X * 10, q.RangeBox.MaxPoint.Y * 10)
+                for q in items(sh.PartsLists)]
+    if tb is not None:
+        blocked.append((tb.MinPoint.X * 10, tb.MinPoint.Y * 10, tb.MaxPoint.X * 10, tb.MaxPoint.Y * 10))
+
+    def free(px, py, own):
+        bx_ = (px - 7, py - 7, px + 7, py + 7)
+        return (16 < px < W - 16 and 16 < py < H - 16 and not _overlap(bx_, box)
+                and not any(_overlap(bx_, o) for o in blocked)
+                and all(math.hypot(px - qx, py - qy) >= BALLOON_GAP for qx, qy in taken + own))
+
+    placed, left = 0, list(want)
+    for m in (16, 32, 48):                              # nearest track first; parts that don't fit move out a ring
+        if not left:
+            break
+        tr = _track(box, m)
+        us = _spread([_track_param(tr, w_["x"], w_["y"]) for w_ in left], BALLOON_GAP, tr[4])
+        own, nxt = [], []
+        for w_, u in sorted(zip(left, us), key=lambda z: z[1]):
+            spot = None
+            for k in range(0, 9):                       # nudge along the track if this spot is blocked
+                for sgn in ((1,) if k == 0 else (1, -1)):
+                    px, py = _track_point(tr, u + sgn * k * BALLOON_GAP / 3)
+                    if free(px, py, own):
+                        spot = (px, py)
+                        break
+                if spot:
                     break
-            if bx is not None:
-                break
-        if bx is None:
-            bx, by = cx + dx / n * rad, cy + dy / n * rad
-        pts = s.collection([s.tg.CreatePoint2d(bx * MM, by * MM), sh.CreateGeometryIntent(c)])
-        bal = safe(lambda: sh.Balloons.Add(pts), None)
-        if bal is not None:
-            done.add(fname)
+            if spot is None:
+                nxt.append(w_)
+                continue
+            c = w_["curve"]
+            if w_.get("point"):                         # a circle: attach at the rim point nearest the outside
+                at = s.tg.CreatePoint2d(w_["x"] * MM, w_["y"] * MM)
+                intent = safe(lambda c=c, at=at: sh.CreateGeometryIntent(c, at)) or sh.CreateGeometryIntent(c)
+            else:
+                intent = safe(lambda c=c: sh.CreateGeometryIntent(c, K.kMidPointIntent)) or sh.CreateGeometryIntent(c)
+            pts = s.collection([s.tg.CreatePoint2d(spot[0] * MM, spot[1] * MM), intent])
+            bal = safe(lambda pts=pts: sh.Balloons.Add(pts), None)
+            if bal is None:
+                continue
             nums = {str(safe(lambda vs=vs: vs.ItemNumber, "")) for vs in items(safe(lambda: bal.BalloonValueSets))}
             if nums and nums <= already:               # this item is ballooned elsewhere on the sheet
                 safe(lambda: bal.Delete())
                 continue
             already |= nums
+            own.append(spot)
             placed += 1
-            taken.append((bx, by))
-    return {"balloons": placed, "view": v.Name}
+        taken += own
+        left = nxt
+    return placed
+
 
 
 TB_FIELDS = {"title": ("Inventor Summary Information", "Title"), "drawing_number": ("Design Tracking Properties", "Part Number"),
@@ -741,7 +834,7 @@ def _base_sizes(L: list[float], base: str, rotate: bool) -> tuple:
 
 
 def _layout(s: Session, md, want: list[str], third: bool, scale: float, label_gap: float = 14.0,
-            gap: float = 22.0, base: str = "front", rotate: bool = False) -> dict:
+            gap: float = 22.0, base: str = "front", rotate: bool = False, block_frac: float = 0.66) -> dict:
     """Place FRONT (+TOP/+RIGHT projected) in the left ~70 % of the free area and an ISOMETRIC in the
     top-right, all clear of the title block. Inventor's Front view of a part shows X across and Y up."""
     sh = _sheet(s)
@@ -753,7 +846,7 @@ def _layout(s: Session, md, want: list[str], third: bool, scale: float, label_ga
     has_top, has_right = "top" in want, "right" in want
     dm = 30.0          # room left of / below the views for dimensions
     g = dict(g, x0=g["x0"] + dm, y0=g["y0"] + dm * 0.6)
-    block_w = (g["x1"] - g["x0"]) * 0.66
+    block_w = (g["x1"] - g["x0"]) * block_frac
     block_h = g["y1"] - g["y0"]
     need_w = fw + (rw if has_right else 0)
     need_h = fh + (th if has_top else 0)
@@ -1499,16 +1592,19 @@ def _tilt_base(s: Session, md) -> bool:
     return True
 
 
-def _ga_sheet_size(s: Session, md, rows: int) -> str:
+def _ga_sheet_size(s: Session, md, rows: int, base: str = "front", want=("front", "top")) -> str:
     """Smallest sheet (A3, A2, A1) that reaches the largest standard scale for the GA views."""
     L = _extents(md)
-    need_w, need_h = L[0] + L[2], L[1] + L[2]
+    fw, fh, dp = _base_sizes(L, base, False)
+    need_w = fw + (dp + 22 if "right" in want else 0)
+    need_h = fh + (dp + 36 if "top" in want else 0)
     sizes = {"A3": (420, 297), "A2": (594, 420), "A1": (841, 594)}
     best = {}
     for name, (W, H) in sizes.items():
         if name == "A1" and rows <= 20 and best:
             pass
-        avail_w, avail_h = (W - 60) * 0.66 - 22, H - 80 - 22 - 28
+        frac = 0.72 if "right" in want else 0.66
+        avail_w, avail_h = (W - 60 - 30) * frac - (22 if "right" in want else 0), H - 80 - 22 - 28
         best[name] = _pick_scale(need_w, need_h, avail_w, avail_h)
     top = max(best.values())
     return next(n for n in ("A3", "A2", "A1") if best[n] == top)
@@ -1517,9 +1613,13 @@ def _ga_sheet_size(s: Session, md, rows: int) -> str:
 @tool("drawing")
 def make_assembly_sheet(s: Session, model: str = "", scale: float = 0.0, sheet_size: str = "A3",
                         standard: str = "", title: str = "", drawing_number: str = "",
-                        drawn_by: str = "", up: str = "auto") -> dict:
-    """One-shot general-arrangement (GA) drawing of an assembly: FRONT + TOP, shaded ISOMETRIC, parts
-    list above the title block, balloons, labels, title block, QA.
+                        drawn_by: str = "", up: str = "auto", views: str = "front,top,right") -> dict:
+    """One-shot general-arrangement (GA) drawing of an assembly: FRONT, TOP and RIGHT (projected, so each sits
+    where the projection angle puts it), shaded ISOMETRIC, parts list above the title block, balloons, labels,
+    title block, QA. To add a view afterwards, project it from FRONT with add_projected_view rather than placing a
+    new base view: a base view of a Z-up model in Inventor's "right" orientation comes out as the plan on its side.
+
+    views: orthographic views, from front, top, right (front is always drawn)
 
     sheet_size: A3, A2, A1 or auto (the smallest sheet that reaches the largest standard scale)
     up: the model's up axis: y (Inventor's default), z (vehicles, frames, anything modelled on the XY ground
@@ -1530,16 +1630,18 @@ def make_assembly_sheet(s: Session, model: str = "", scale: float = 0.0, sheet_s
         raise InventorError("make_assembly_sheet needs an assembly")
     standard = s.standard_key(standard)
     third = _third(standard)
-    if sheet_size.lower() == "auto":
-        sheet_size = _ga_sheet_size(s, md, safe(lambda: md.ComponentDefinition.Occurrences.Count, 0))
-    create_drawing(s, standard=standard, sheet_size=sheet_size)
     L = _extents(md)
     u = (up or "auto").lower()
     if u == "auto":
         u = "z" if L[2] < min(L[0], L[1]) else "y"      # flattest along Z: modelled on the XY ground plane
+    want = ["front"] + [w for w in ("top", "right") if w in (views or "").lower()]
+    base = "bottom" if u == "z" else "front"
+    if sheet_size.lower() == "auto":
+        sheet_size = _ga_sheet_size(s, md, safe(lambda: md.ComponentDefinition.Occurrences.Count, 0), base, want)
+    create_drawing(s, standard=standard, sheet_size=sheet_size)
     # Z up: the elevation (looking along Y) is the FRONT view and the plan (looking down Z) the TOP
     # Inventor's Bottom orientation looks along +Y with Z up the sheet: the elevation of a Z-up model
-    lay = _layout(s, md, ["front", "top", "iso"], third, scale, base="bottom" if u == "z" else "front")
+    lay = _layout(s, md, want + ["iso"], third, scale, base=base, block_frac=0.72 if "right" in want else 0.66)
     pl = add_parts_list(s, "FRONT")
     # if the iso view now collides with the parts list, shrink it toward the top-right
     sh = _sheet(s)
@@ -1554,8 +1656,8 @@ def make_assembly_sheet(s: Session, model: str = "", scale: float = 0.0, sheet_s
             iso.Position = s.tg.CreatePoint2d((g["x1"] - (b[2] - b[0]) / 2 - 2) * MM,
                                               (g["y1"] - (b[3] - b[1]) / 2 - 2) * MM)
     bl = auto_balloon(s)
-    # parts hidden in that view (rims inside tyres in a plan) get their balloon on the other orthographic view
-    for other in ("FRONT", "TOP"):
+    # parts hidden in that view (rims inside tyres in a plan) get their balloon on another orthographic view
+    for other in ("FRONT", "TOP", "RIGHT"):
         if other != bl.get("view") and any(o.Name == other for o in items(sh.DrawingViews)):
             extra = safe(lambda o=other: auto_balloon(s, view=o), {"balloons": 0})
             bl["balloons"] = bl.get("balloons", 0) + extra.get("balloons", 0)
