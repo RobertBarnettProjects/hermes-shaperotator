@@ -634,9 +634,33 @@ def _aim_z_up(s: Session, view: str) -> None:
     cam.ApplyWithoutTransition()
 
 
+_CONSTRUCTION = ("Sketches", "Sketches3D", "SketchDimensions", "UserWorkPlanes", "UserWorkAxes", "UserWorkPoints",
+                 "OriginWorkPlanes", "OriginWorkAxes", "OriginWorkPoints", "ConstructionSurfaces")
+
+
+def _hide_construction(d) -> dict:
+    """Turn off the document's construction geometry for a clean picture; returns what to put back."""
+    ov = safe(lambda: d.ObjectVisibility)
+    if ov is None:
+        return {}
+    was = {}
+    for name in _CONSTRUCTION:
+        cur = safe(lambda n=name: getattr(ov, n))
+        if cur:
+            if safe(lambda n=name: (setattr(ov, n, False), True)[1], False):
+                was[name] = cur
+    return was
+
+
+def _restore_construction(d, was: dict) -> None:
+    ov = safe(lambda: d.ObjectVisibility)
+    for name, value in (was or {}).items():
+        safe(lambda n=name, v=value: setattr(ov, n, v))
+
+
 @tool("view", mutates=False)
 def screenshot(s: Session, path: str = "", view: str = "", width: int = 1600, height: int = 1000,
-               views: str = "", up: str = "y") -> dict:
+               views: str = "", up: str = "y", clean: bool = True) -> dict:
     """Save a PNG of the active document's view (model or drawing sheet) — look at it to check your work. Each
     image comes with its scale (mm per pixel) so sizes on it can be read off. With views, one PNG per orientation
     in a single call, and the user's camera is put back afterwards.
@@ -645,10 +669,17 @@ def screenshot(s: Session, path: str = "", view: str = "", width: int = 1600, he
     views: several orientations at once, e.g. "iso,front,top,right" (path is then a folder or a name prefix)
     up: "y" (Inventor's convention) or "z" for models built Z-up, such as parts laid out on a 3D printer's bed:
         top then looks down Z and iso has Z pointing up
+    clean: hide sketches, work planes/axes/points and the origin while the picture is taken (put back after)
     """
     up = (up or "y").strip().lower()
     if up not in ("y", "z"):
         raise InventorError("up must be 'y' or 'z'")
+    if clean and s.kind(s.doc()) != "drawing":
+        hidden = _hide_construction(s.doc())
+        try:
+            return screenshot(s, path=path, view=view, width=width, height=height, views=views, up=up, clean=False)
+        finally:
+            _restore_construction(s.doc(), hidden)
     if views:
         wanted = [w.strip() for w in views.split(",") if w.strip()]
         v = s.view()
@@ -671,7 +702,8 @@ def screenshot(s: Session, path: str = "", view: str = "", width: int = 1600, he
             for w in wanted:
                 p_ = (os.path.join(base, f"view-{w}.png") if is_dir else
                       (base[:-4] if base.lower().endswith(".png") else base) + f"-{w}.png")
-                shots.append({"view": w, **screenshot(s, path=p_, view=w, width=width, height=height, up=up)})
+                shots.append({"view": w, **screenshot(s, path=p_, view=w, width=width, height=height, up=up,
+                                                        clean=False)})
         finally:
             if keep is not None:
                 safe(lambda: (setattr(cam, "Eye", keep[0]), setattr(cam, "Target", keep[1]),
