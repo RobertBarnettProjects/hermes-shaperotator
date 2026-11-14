@@ -711,11 +711,12 @@ def _save(s: Session) -> bool:
     d = s.doc()
     if not safe(lambda: d.FullFileName, ""):
         return False
+    from .docs import guarded_save
     app = s.app
     was = app.SilentOperation
     app.SilentOperation = True
     try:
-        d.Save()
+        guarded_save(d)
     finally:
         app.SilentOperation = was
     return True
@@ -768,7 +769,8 @@ def run_study_cases(s: Session, template: str, cases: list[dict], results_path: 
     want = results or ["Von Mises Stress", "Displacement"]
     pid = _pid(s)
     doc_name = re.sub(r"\W+", "_", s.doc().DisplayName)
-    path = results_path or os.path.join(s.workdir, "studies", f"{doc_name}_cases.json")
+    from ..writes import output_path
+    path = output_path(s.workdir, results_path or f"{doc_name}_cases.json", "studies", ".json")
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     data = _load_results(path)
     names = [c.get("name", "") for c in cases]
@@ -788,6 +790,8 @@ def run_study_cases(s: Session, template: str, cases: list[dict], results_path: 
                 raise InventorError(f"case {name!r} was already run with different values or template; give it a new name")
             skipped += 1
             continue
+        if done.get("status") == "failed" and name in safe(lambda: _study_nodes(s), {}):
+            safe(lambda: delete_study_item(s, name))      # a copy left by the failed attempt: start this case afresh
         while True:
             try:
                 _run_case(s, pid, template, case, want, timeout, data, path)
@@ -796,9 +800,15 @@ def run_study_cases(s: Session, template: str, cases: list[dict], results_path: 
             except Exception as e:
                 inventor_died = bool(private and doc_path and pid not in U.pids_named("Inventor.exe"))
                 if not inventor_died and _case_level(e):
-                    # this case can't be solved (degenerate mesh, values not kept...): record why and run the rest
-                    data["cases"][name] = {"status": "failed", "error": str(e)[:600], "values": case.get("values"),
-                                           "template": template}
+                    # this case can't be solved (degenerate mesh, values not kept...): record why, remove its
+                    # half-made study copy so a later call can retry it cleanly, and run the rest
+                    history = list(data["cases"].get(name, {}).get("errors", []))
+                    history.append(str(e)[:600])
+                    data["cases"][name] = {"status": "failed", "error": history[0], "errors": history[-5:],
+                                           "values": case.get("values"), "template": template}
+                    if name in safe(lambda: _study_nodes(s), {}):
+                        data["cases"][name]["copy_removed"] = bool(safe(lambda: (delete_study_item(s, name), True)[1],
+                                                                        False))
                     _store_results(path, data)
                     failed += 1
                     break

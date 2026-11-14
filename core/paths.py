@@ -167,7 +167,9 @@ def written_args(tool_name: str, args: Any) -> list[tuple[str, str]]:
     if tool_name == "cad_native":
         tool = str(args.get("tool", ""))
         targs = args.get("args") if isinstance(args.get("args"), dict) else {}
-        if forge_declares():                            # exactly what the forge says this tool writes
+        if forge_declares() and (tool in FA.WRITES or tool in FA.READS or tool in FA.NAMES or tool in FA.KNOWN):
+            # exactly what the forge says this tool writes; a tool this list doesn't know (another forge version)
+            # falls through to the cautious checks below
             return [(k, targs[k]) for k in FA.WRITES.get(tool, ()) if isinstance(targs.get(k), str) and targs[k].strip()]
         reads = NATIVE_READS.get(tool, set())
         names = NATIVE_NAMES.get(tool, ())

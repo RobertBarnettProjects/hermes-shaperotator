@@ -364,31 +364,30 @@ def _release_path(s: Session, d, path: str) -> None:
                                 "close it first or save under a different name")
 
 
-def protected_roots() -> list[str]:
-    """Folders a model must never be written into: Autodesk's libraries, templates and install folders, and any the
-    user lists in INVENTOR_FORGE_PROTECTED (separated by ';')."""
-    import glob
-    roots = []
-    public = os.path.join(os.environ.get("PUBLIC", r"C:\Users\Public"), "Documents", "Autodesk")
-    for inv in glob.glob(os.path.join(public, "Inventor *")):      # library folders only, not the project workspace
-        roots += [os.path.join(inv, sub) for sub in ("Templates", "Design Data", "Content Center Files")]
-    for env in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"):
-        v = os.environ.get(env)
-        if v:
-            roots.append(os.path.join(v, "Autodesk"))
-    roots += [x for x in os.environ.get("INVENTOR_FORGE_PROTECTED", "").split(";") if x.strip()]
-    return [os.path.normcase(os.path.realpath(r_)) for r_ in roots]
+from ..writes import guard as _guard_write, output_path, protected_roots  # noqa: E402,F401
 
 
-def _guard_write(path: str, what: str = "save") -> None:
-    """Refuse to write into a protected folder or over a read-only file."""
-    rp = os.path.normcase(os.path.realpath(path))
-    for root in protected_roots():
-        if rp == root or rp.startswith(root.rstrip("\\/") + os.sep):
-            raise InventorError(f"won't {what} {path}: it is inside {root} (Autodesk's libraries, templates or install, "
-                                "or a folder listed in INVENTOR_FORGE_PROTECTED). Save a copy elsewhere with a path")
-    if os.path.exists(path) and not os.access(path, os.W_OK):
-        raise InventorError(f"won't {what} {path}: the file is read-only (checked in, or a library part)")
+def _guard_dependents(d) -> None:
+    """Save also writes changed parts the document uses: none of them may be in a protected folder."""
+    from ..writes import protected_roots as _roots
+    roots = _roots()
+    for ref in items(safe(lambda: d.AllReferencedDocuments) or []):
+        if not safe(lambda ref=ref: ref.Dirty, False):
+            continue
+        fn = os.path.normcase(os.path.realpath(safe(lambda ref=ref: ref.FullFileName, "") or ""))
+        if fn and any(fn.startswith(r_.rstrip("\\/") + os.sep) for r_ in roots):
+            raise InventorError(f"won't save: the changed part {fn} is in a protected folder ({fn}); undo that "
+                                "change or save the assembly's parts elsewhere first")
+
+
+def guarded_save(d) -> None:
+    """Save a document where it is, through the same gate as every other write."""
+    fn = safe(lambda: d.FullFileName, "")
+    if not fn:
+        raise InventorError("the document has never been saved; save_document with a path")
+    _guard_write(fn, "save")
+    _guard_dependents(d)
+    d.Save()
 
 
 @tool("documents")
@@ -420,9 +419,7 @@ def save_document(s: Session, path: str = "") -> dict:
             name = plain_name(safe(lambda: d.DisplayName, "Untitled").split(".")[0], "Untitled")
             return save_document(s, os.path.join(s.workdir, name))
         _guard_write(safe(lambda: d.FullFileName, ""))
-        for ref in items(safe(lambda: d.AllReferencedDocuments) or []):     # Save also writes changed dependents
-            if safe(lambda ref=ref: ref.Dirty, False):
-                _guard_write(safe(lambda ref=ref: ref.FullFileName, ""), "save the changed part")
+        _guard_dependents(d)
         d.Save()
     return {"saved": safe(lambda: d.FullFileName, path)}
 
@@ -434,7 +431,10 @@ def close_document(s: Session, save: bool = False, name: str = "") -> dict:
     label = safe(lambda: d.DisplayName, "")
     if save:
         active = s.app.ActiveDocument
-        save_document(s) if active is not None and s.key(d) == s.key(active) else d.Save()
+        if active is not None and s.key(d) == s.key(active):
+            save_document(s)
+        else:
+            guarded_save(d)
     if getattr(s, "_current", None) is not None and s.key(d) == getattr(s, "_current_key", None):
         s.set_current(None)
     d.Close(not save)          # SkipSave
@@ -561,11 +561,7 @@ def export_document(s: Session, path: str, format: str = "") -> dict:
     ext = EXPORT_EXT.get(fmt)
     if not ext:
         raise InventorError(f"unknown export format {fmt!r}; use one of {sorted(set(EXPORT_EXT))}")
-    if not os.path.isabs(path):
-        path = os.path.join(s.workdir, "exports", path)
-    if not os.path.splitext(path)[1]:
-        path += ext
-    _guard_write(path, "export to")
+    path = output_path(s.workdir, path, "exports", ext if not os.path.splitext(path)[1] else "", "export to")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if os.path.exists(path):
         os.remove(path)
@@ -625,11 +621,21 @@ def screenshot(s: Session, path: str = "", view: str = "", width: int = 1600, he
         keep = None
         if cam is not None:
             keep = (cam.Eye, cam.Target, cam.UpVector, safe(lambda: cam.Perspective, False))
-        stem = path or f"views-{int(time.time() * 1000)}"
+        import re as _re
+        bad = [w for w in wanted if not _re.fullmatch(r"[a-z_]+", w.lower())]
+        if bad:
+            raise InventorError(f"views must be orientation names (iso, front, top...), not {bad}")
+        # a folder (existing, or ending in a separator, or ".") gets one file per view inside it; anything else is a
+        # name prefix next to which the views are written, in the same folder
+        base = path or os.path.join("renders", f"views-{int(time.time() * 1000)}")
+        if not os.path.isabs(base):
+            base = os.path.join(s.workdir, base)
+        is_dir = os.path.isdir(base) or path.endswith(("/", "\\")) or os.path.basename(path) in (".", "")
         shots = []
         try:
             for w in wanted:
-                p_ = stem + f"-{w}.png" if not stem.lower().endswith(".png") else stem[:-4] + f"-{w}.png"
+                p_ = (os.path.join(base, f"view-{w}.png") if is_dir else
+                      (base[:-4] if base.lower().endswith(".png") else base) + f"-{w}.png")
                 shots.append({"view": w, **screenshot(s, path=p_, view=w, width=width, height=height)})
         finally:
             if keep is not None:
@@ -642,11 +648,7 @@ def screenshot(s: Session, path: str = "", view: str = "", width: int = 1600, he
     v = s.view()
     if v is None:
         raise InventorError("no active view to capture")
-    if not path:
-        path = os.path.join(s.workdir, "renders", f"view-{int(time.time() * 1000)}.png")
-    elif not os.path.isabs(path):
-        path = os.path.join(s.workdir, "renders", path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    path = output_path(s.workdir, path or f"view-{int(time.time() * 1000)}.png", "renders", ".png")
     try:
         white = s.to.CreateColor(255, 255, 255)
         v.Camera.SaveAsBitmap(path, int(width), int(height), white, white)

@@ -108,11 +108,8 @@ def flat_pattern(s: Session, dxf_path: str = "") -> dict:
            "bend_results": safe(lambda: fp.FlatBendResults.Count, None),
            "thickness_mm": r(cd.Thickness.Value * 10, 4)}
     if dxf_path:
-        if not os.path.isabs(dxf_path):
-            dxf_path = os.path.join(s.workdir, "exports", dxf_path)
-        if not dxf_path.lower().endswith(".dxf"):
-            dxf_path += ".dxf"
-        os.makedirs(os.path.dirname(dxf_path), exist_ok=True)
+        from ..writes import output_path
+        dxf_path = output_path(s.workdir, dxf_path, "exports", ".dxf", "export to")
         opts = "FLAT PATTERN DXF?AcadVersion=2010&OuterProfileLayer=OUTER&InteriorProfilesLayer=INNER" \
                "&BendUpLayer=BEND_UP&BendDownLayer=BEND_DOWN&InvisibleLayers=IV_TANGENT;IV_ARC_CENTERS"
         fp.DataIO.WriteDataToFile(opts, dxf_path)

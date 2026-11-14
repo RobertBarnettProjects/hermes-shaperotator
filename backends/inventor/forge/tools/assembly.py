@@ -226,6 +226,7 @@ def bill_of_materials(s: Session, csv_path: str = "") -> dict:
     """Parts-only BOM: item, quantity, part number, description, material, mass; optional CSV export."""
     asm = s.assembly()
     bom = asm.ComponentDefinition.BOM
+    was_enabled = bool(safe(lambda: bom.PartsOnlyViewEnabled, True))
     bom.PartsOnlyViewEnabled = True
     view = None
     for v in items(bom.BOMViews):
@@ -242,11 +243,12 @@ def bill_of_materials(s: Session, csv_path: str = "") -> dict:
                      "description": ps("Design Tracking Properties", "Description"),
                      "material": safe(lambda: doc.ActiveMaterial.DisplayName, ""),
                      "unit_mass_kg": safe(lambda: r(cdef.MassProperties.Mass, 4))})
+    if not was_enabled:                               # read the BOM without changing the assembly's settings
+        safe(lambda: setattr(bom, "PartsOnlyViewEnabled", False))
     out = {"bom": rows}
     if csv_path:
-        if not os.path.isabs(csv_path):
-            csv_path = os.path.join(s.workdir, "exports", csv_path)
-        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        from ..writes import output_path
+        csv_path = output_path(s.workdir, csv_path, "exports", ".csv")
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]) if rows else ["item"])
             w.writeheader()
@@ -319,7 +321,8 @@ def sweep_clearance(s: Session, constraint: str, start: float, stop: float, step
                     d = d[0] if isinstance(d, tuple) else d
                     if d is not None and (gap is None or d * 10 < gap):
                         gap, gap_to = d * 10, o.Name
-            row = {"value": r(value, 4), "clashes": clashes, "min_gap_mm": r(gap, 3) if gap is not None else 0.0,
+            row = {"value": r(value, 4), "clashes": clashes,
+                   "min_gap_mm": (0.0 if clashes else None) if gap is None else r(gap, 3),
                    "nearest": gap_to or (clashes[0]["with"] if clashes else "")}
             rows.append(row)
             if clashes and first_clash is None:

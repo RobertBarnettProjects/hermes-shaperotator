@@ -236,3 +236,9 @@ def test_forge_backend_uses_declared_file_arguments(job, tmp_path, monkeypatch):
     assert P._pre_tool_call(tool_name="cad_native", args={"tool": "open_document", "args": {"path": str(tmp_path / "c.ipt")}}) is None
     assert P._pre_tool_call(tool_name="cad_native", args={"tool": "add_general_notes", "args": {"text": r"/ 2 PLACES ~ C:\x"}}) is None
     assert P._pre_tool_call(tool_name="cad_native", args={"tool": "export_document", "args": {"path": "out/a.step"}}) is None
+
+
+def test_tool_unknown_to_this_forge_version_is_checked_cautiously(job, tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "forge_declares", lambda: True)
+    out = P._pre_tool_call(tool_name="cad_native", args={"tool": "future_export", "args": {"out_path": str(tmp_path / "x.txt")}})
+    assert out and out["action"] == "approve"

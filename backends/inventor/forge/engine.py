@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeout
 import traceback
@@ -77,6 +78,7 @@ class Forge:
         self.session = Session(visible=visible)
         self.tools = TOOLS
         self.pending: dict | None = None          # a call left waiting on Inventor (a dialog, or too slow)
+        self._pending_lock = threading.Lock()
         self.session.forge = self
 
     def call(self, name: str, args: dict | None = None, timeout: float | None = DEFAULT_WAIT) -> dict:
@@ -154,15 +156,21 @@ class Forge:
                 before = {r_["hwnd"] for r_ in U.dialog_rows(pid)}
             except Exception:  # noqa: BLE001
                 pid = None
-        fut = self.apartment.submit(run)
+        with self._pending_lock:
+            if self.pending is not None and not self.pending["future"].done():
+                raise InventorError(f"an earlier call ({self.pending['tool']}) is still waiting on Inventor; "
+                                    "pending_call shows it")
+            fut = self.apartment.submit(run)
         t0 = time.time()
+        limit = float("inf") if wait is None else float(wait)
         while True:
             try:
-                return fut.result(timeout=min(2.0, max(0.1, t0 + wait - time.time())))
+                return fut.result(timeout=min(2.0, max(0.1, t0 + limit - time.time())))
             except FutureTimeout:
                 pass
-            if time.time() - t0 >= wait:
-                self.pending = {"tool": name, "future": fut, "started": t0, "dialogs": []}
+            if time.time() - t0 >= limit:
+                with self._pending_lock:
+                    self.pending = {"tool": name, "future": fut, "started": t0, "dialogs": []}
                 raise InventorError(f"{name}: no answer after {wait:.0f} s. The call may still be running in Inventor (a "
                                     "solve carries on regardless); check solve_state or pending_call before calling "
                                     "anything else") from None
@@ -173,7 +181,8 @@ class Forge:
                 except Exception:  # noqa: BLE001
                     dialogs = []
                 if dialogs:
-                    self.pending = {"tool": name, "future": fut, "started": t0, "dialogs": dialogs}
+                    with self._pending_lock:
+                        self.pending = {"tool": name, "future": fut, "started": t0, "dialogs": dialogs}
                     raise InventorError(f"{name}: Inventor is waiting on a dialog and the call can't finish until it is "
                                         f"answered: {_dialog_text(dialogs)}. Answer it with answer_dialog(button=...) "
                                         "(or ask the user to), then pending_call shows the call's result")

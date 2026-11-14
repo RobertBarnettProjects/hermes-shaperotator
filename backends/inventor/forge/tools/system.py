@@ -144,7 +144,8 @@ def pending_call(s: Session, wait_seconds: float = 0.0) -> dict:
         res = fut.result(timeout=max(0.0, float(wait_seconds)))
     except cf.TimeoutError:
         from .. import uidrive as U
-        dialogs = U.dialog_rows(s.pid) if s.pid else []
+        held = {d_["hwnd"] for d_ in p.get("dialogs") or []}
+        dialogs = [d_ for d_ in (U.dialog_rows(s.pid) if s.pid else []) if not held or d_["hwnd"] in held]
         return {"pending": True, "tool": p["tool"], "running_s": round(_t.time() - p["started"], 1),
                 "dialogs": [{k: d[k] for k in ("title", "text", "buttons")} for d in dialogs]}
     except Exception as e:  # noqa: BLE001
@@ -155,17 +156,26 @@ def pending_call(s: Session, wait_seconds: float = 0.0) -> dict:
 
 
 @tool("system", com=False)
-def answer_dialog(s: Session, button: str, title: str = "") -> dict:
-    """Press a button on an Inventor dialog that is holding up a call (pending_call lists them), with a window
+def answer_dialog(s: Session, button: str, title: str = "", any_dialog: bool = False) -> dict:
+    """Press a button on the Inventor dialog that is holding up a call (pending_call shows it), with a window
     message, not the mouse. Only use a button the user would agree to: ask them when it matters (e.g. "Save").
+    Dialogs the user opened themselves are left alone unless any_dialog is set (only on the user's request).
 
     button: the button's label as listed (OK, Cancel, Yes, No...)
-    title: which dialog, when more than one is open (default: the first)
+    title: which dialog, when more than one is held (default: the first)
+    any_dialog: allow a dialog no tool call is waiting on
     """
     from .. import uidrive as U
     if not s.pid:
         raise InventorError("not connected to an Inventor")
-    dialogs = [d for d in U.dialog_rows(s.pid) if not title or title.lower() in d["title"].lower()]
+    forge = getattr(s, "forge", None)
+    p = getattr(forge, "pending", None)
+    held = {d_["hwnd"] for d_ in (p or {}).get("dialogs") or []}
+    if not held and not any_dialog:
+        raise InventorError("no tool call is waiting on a dialog (pending_call); dialogs the user opened are theirs "
+                            "to answer")
+    dialogs = [d for d in U.dialog_rows(s.pid) if (any_dialog or d["hwnd"] in held)
+               and (not title or title.lower() in d["title"].lower())]
     if not dialogs:
         raise InventorError("Inventor shows no dialog" + (f" titled like {title!r}" if title else ""))
     d = dialogs[0]
@@ -237,6 +247,7 @@ def execute_python(s: Session, code: str, undo_on_error: bool = True) -> dict:
             cdef = None
     _NS.update({"app": app, "doc": doc, "cdef": cdef, "tg": app.TransientGeometry, "to": app.TransientObjects,
                 "K": K, "items": items, "typed_call": typed_call, "MM": MM, "session": s})
+    _log_snippet(s, code, "start")
     buf = io.StringIO()
     result = None
     txn = None

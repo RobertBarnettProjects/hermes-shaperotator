@@ -176,7 +176,7 @@ def _standard_note(s: Session, standard: str) -> dict:
     spec = STANDARDS[key(standard)]
     units = "INCHES" if getattr(s, "drawing_units", "mm") == "in" and key(standard) == "ASME" else "mm"
     lines = ["UNLESS OTHERWISE STATED:", f"DIMENSIONS IN {units}",
-             f"GENERAL TOLERANCES: {spec['general_tolerance'].upper()}",
+             f"GENERAL TOLERANCES: {spec['general_tolerance']}",       # case matters: ISO 2768-m, -mK
              f"{spec['projection'].upper()} ANGLE PROJECTION", f"DRAWN TO {spec['drawing'].split(',')[0].upper()}"]
     sh = _sheet(s)
     for n in items(sh.DrawingNotes.GeneralNotes):        # one per sheet
@@ -646,8 +646,7 @@ def auto_balloon(s: Session, view: str = "") -> dict:
     if view:
         v = _view(s, view)
     else:       # an orthographic view shows outlines best
-        vs = [w for w in items(sh.DrawingViews) if "Iso" not in K.name_of(safe(lambda w=w: w.Camera.ViewOrientationType, 0), "k")
-              and not str(safe(lambda w=w: w.Name, "")).upper().startswith("ISO")]       # nor a camera-aimed iso
+        vs = [w for w in items(sh.DrawingViews) if not _is_iso_view(w)]
         def area(w):
             b_ = _box(w)
             return (b_[2] - b_[0]) * (b_[3] - b_[1])
@@ -1593,9 +1592,9 @@ def make_part_sheet(s: Session, model: str = "", views: str = "front,top,right,i
                                     lambda: md.ActiveMaterial.DisplayName, ""))) if v}
     set_title_block_field(s, fields)
     safe(lambda: add_projection_symbol(s, third_angle=third))
-    safe(lambda: _standard_note(s, standard))
+    note = safe(lambda: _standard_note(s, standard), {}) or {}
     return {"scale": _scale_text(lay["scale"]), "views": [m["name"] for m in lay["views"]], **steps,
-            "qa": check_drawing(s)}
+            **({"notes_warning": note["warning"]} if note.get("warning") else {}), "qa": check_drawing(s)}
 
 
 def _cross_hole(s: Session, md, base: str):
@@ -1739,8 +1738,9 @@ def make_assembly_sheet(s: Session, model: str = "", scale: float = 0.0, sheet_s
     set_title_block_field(s, {k: v for k, v in (("title", title or md.DisplayName.split(".")[0].upper()),
                                                 ("drawing_number", drawing_number), ("drawn_by", drawn_by)) if v})
     safe(lambda: add_projection_symbol(s, third_angle=third))
-    safe(lambda: _standard_note(s, standard))
+    note = safe(lambda: _standard_note(s, standard), {}) or {}
     return {"scale": _scale_text(lay["scale"]), "sheet": sheet_size, "up": u, "parts_list_rows": pl["rows"], "balloons": bl["balloons"],
+            **({"notes_warning": note["warning"]} if note.get("warning") else {}),
             "qa": check_drawing(s)}
 
 
@@ -1910,8 +1910,18 @@ def _standard_issues(s: Session, d, sh, std_key: str) -> list[str]:
 
 
 def _is_iso_view(v) -> bool:
+    """Is the view a pictorial (not orthographic) one? From its camera: an iso orientation, or a camera that looks
+    along more than one axis. The view's name plays no part."""
     o = K.name_of(safe(lambda: v.Camera.ViewOrientationType, 0), "k")
-    return "Iso" in o or str(safe(lambda: v.Name, "")).upper().startswith("ISO")
+    if "Iso" in o:
+        return True
+    cam = safe(lambda: v.Camera)
+    e, t = safe(lambda: cam.Eye), safe(lambda: cam.Target)
+    if e is None or t is None:
+        return False
+    d = [e.X - t.X, e.Y - t.Y, e.Z - t.Z]
+    n = sum(x * x for x in d) ** 0.5 or 1.0
+    return sum(1 for x in d if abs(x) / n > 0.05) > 1
 
 
 def _ortho_base_views(sh, md) -> list:
@@ -2098,11 +2108,8 @@ def render_sheet(s: Session, path: str = "", width: int = 2400) -> dict:
     """PNG of the active sheet (look at it before exporting)."""
     d = s.drawing()
     sh = d.ActiveSheet
-    if not path:
-        path = os.path.join(s.workdir, "renders", f"sheet-{int(time.time() * 1000)}.png")
-    elif not os.path.isabs(path):
-        path = os.path.join(s.workdir, "renders", path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    from ..writes import output_path
+    path = output_path(s.workdir, path or f"sheet-{int(time.time() * 1000)}.png", "renders", ".png")
     d.Activate()
     v = s.view()
     safe(lambda: v.Fit())
@@ -2115,11 +2122,8 @@ def render_sheet(s: Session, path: str = "", width: int = 2400) -> dict:
 def export_pdf(s: Session, path: str, all_sheets: bool = True) -> dict:
     """Export the drawing (all sheets by default) to PDF, vector, black lines."""
     d = s.drawing()
-    if not os.path.isabs(path):
-        path = os.path.join(s.workdir, "exports", path)
-    if not path.lower().endswith(".pdf"):
-        path += ".pdf"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    from ..writes import output_path
+    path = output_path(s.workdir, path, "exports", ".pdf", "export to")
     app = s.app
     tr = app.ApplicationAddIns.ItemById(PDF_TRANSLATOR)
     ctx = app.TransientObjects.CreateTranslationContext()
