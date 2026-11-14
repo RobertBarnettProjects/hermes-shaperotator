@@ -55,9 +55,19 @@ class Apartment:
     def run(self, fn: Callable[[], Any], timeout: float | None = 1800) -> Any:
         if threading.get_ident() == self._ident:      # re-entrant call from inside the apartment
             return fn()
+        return self.submit(fn).result(timeout=timeout)
+
+    def submit(self, fn: Callable[[], Any]) -> cf.Future:
+        """Queue fn on the apartment thread and return its future at once."""
         fut: cf.Future = cf.Future()
+        if threading.get_ident() == self._ident:
+            try:
+                fut.set_result(fn())
+            except BaseException as e:  # noqa: BLE001
+                fut.set_exception(e)
+            return fut
         self._q.put((fn, fut))
-        return fut.result(timeout=timeout)
+        return fut
 
     def close(self) -> None:
         self._q.put((None, None))

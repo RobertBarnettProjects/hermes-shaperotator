@@ -198,6 +198,55 @@ def close(h: int) -> None:
     time.sleep(0.4)
 
 
+def dialog_rows(pid: int, skip: set | None = None) -> list[dict]:
+    """Inventor's open dialogs and prompts, read with window messages only (so this works while Inventor is
+    blocked): title, the text it shows and its buttons. WPF prompts have no readable controls: title only."""
+    out = []
+    for h, cls, title in window_rows(pid):
+        if skip and h in skip:
+            continue
+        if cls != "#32770" and not cls.startswith("HwndWrapper"):
+            continue
+        if not title.strip() and cls != "#32770":       # Inventor's own untitled panels, not prompts
+            continue
+        texts, buttons = [], []
+        for c in controls(h) if cls == "#32770" else []:
+            if not c.visible:
+                continue
+            if c.cls == "Static":
+                t = get_text(c).strip()
+                if t:
+                    texts.append(t)
+            elif c.cls == "Button" and c.enabled:
+                t = get_text(c).replace("&", "").strip()
+                if t:
+                    buttons.append(t)
+        out.append({"hwnd": h, "title": title, "text": " ".join(texts)[:600], "buttons": buttons})
+    return out
+
+
+def modal_blocked(pid: int) -> bool:
+    """Is Inventor's main window disabled, as it is while a modal dialog waits for an answer?"""
+    for h, cls, _t in window_rows(pid):
+        if cls.startswith("AfxMDIFrame"):
+            return not win32gui.IsWindowEnabled(h)
+    return False
+
+
+def press_dialog_button(hwnd: int, label: str) -> bool:
+    """Press a button on a dialog by its label, with a window message (no mouse or keyboard)."""
+    want = label.replace("&", "").strip().lower()
+    for c in controls(hwnd):
+        if c.cls == "Button" and c.visible and c.enabled and get_text(c).replace("&", "").strip().lower() == want:
+            win32gui.SendMessage(c.hwnd, win32con.BM_CLICK, 0, 0)
+            return True
+    # WPF prompts have no Win32 buttons; closing the window is their Cancel
+    if want in ("cancel", "close") and win32gui.GetClassName(hwnd).startswith("HwndWrapper"):
+        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        return True
+    return False
+
+
 def window_rows(pid: int) -> list[tuple[int, str, str]]:
     """Every visible top-level window of a process: (hwnd, class, title). WPF prompts show up here too,
     as HwndWrapper[...] windows, although they have no child controls to read."""

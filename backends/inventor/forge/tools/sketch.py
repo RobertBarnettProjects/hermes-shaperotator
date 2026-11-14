@@ -256,6 +256,68 @@ def draw_point(s: Session, x: float, y: float, hole_center: bool = True) -> dict
     return {**_sketch_info(sk), "drew": f"point ({x}, {y})"}
 
 
+def sketch_problems(sk, gap_mm: float = 2.0) -> dict:
+    """Why a sketch may not close: open ends (curve ends no other curve meets), small gaps between them, points
+    where three or more curves meet, and lines drawn twice. Coordinates in sketch mm."""
+    ends = []          # (x mm, y mm, curve label)
+    for kind, coll in (("line", sk.SketchLines), ("arc", sk.SketchArcs)):
+        for i, e in enumerate(items(coll), 1):
+            if safe(lambda e=e: e.Construction, False):
+                continue
+            for attr in ("StartSketchPoint", "EndSketchPoint"):
+                g = safe(lambda e=e, a=attr: getattr(e, a).Geometry)
+                if g is not None:
+                    ends.append((g.X * 10, g.Y * 10, f"{kind} {i}"))
+    tol = 1e-3
+    groups: list[list] = []
+    for p in ends:
+        for g in groups:
+            if abs(g[0][0] - p[0]) <= tol and abs(g[0][1] - p[1]) <= tol:
+                g.append(p)
+                break
+        else:
+            groups.append([p])
+    open_ends = [g[0] for g in groups if len(g) == 1]
+    junctions = [{"at_mm": [r(g[0][0], 3), r(g[0][1], 3)], "curves": [x[2] for x in g]} for g in groups if len(g) >= 3]
+    gaps = []
+    for i, a in enumerate(open_ends):
+        for b in open_ends[i + 1:]:
+            d = ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+            if d <= gap_mm:
+                gaps.append({"between": [a[2], b[2]], "gap_mm": r(d, 4), "at_mm": [[r(a[0], 3), r(a[1], 3)], [r(b[0], 3), r(b[1], 3)]]})
+    lines = []
+    for i, e in enumerate(items(sk.SketchLines), 1):
+        if safe(lambda e=e: e.Construction, False):
+            continue
+        a_, b_ = e.Geometry.StartPoint, e.Geometry.EndPoint
+        key = tuple(sorted([(round(a_.X * 10, 3), round(a_.Y * 10, 3)), (round(b_.X * 10, 3), round(b_.Y * 10, 3))]))
+        lines.append((key, i))
+    seen, doubled = {}, []
+    for key, i in lines:
+        if key in seen:
+            doubled.append([f"line {seen[key]}", f"line {i}"])
+        else:
+            seen[key] = i
+    closed = not open_ends and not doubled
+    return {"closed_curves_only": closed and not junctions,
+            "open_ends": [{"curve": e[2], "at_mm": [r(e[0], 3), r(e[1], 3)]} for e in open_ends],
+            "gaps": gaps, "three_way_junctions": junctions, "drawn_twice": doubled,
+            "circles": safe(lambda: sk.SketchCircles.Count, 0)}
+
+
+@tool("sketch", mutates=False)
+def check_sketch(s: Session, index: int = 0, gap_mm: float = 2.0) -> dict:
+    """Why a sketch won't make a closed profile: open curve ends with their coordinates, small gaps between ends
+    (to close with draw_line or by redrawing), points where three or more curves meet (Inventor can't tell which
+    region you mean) and lines drawn twice. Run it when extrude/revolve says there is no closed profile.
+
+    index: sketch (1-based; 0 = the active one)
+    gap_mm: report gaps between open ends up to this size
+    """
+    sk = s.sketch(index)
+    return {"sketch": sk.Name, **sketch_problems(sk, gap_mm)}
+
+
 @tool("sketch", mutates=False)
 def sketch_info(s: Session, index: int = 0) -> dict:
     """Entities, dimensions, profile count and constraint status of the active (or given) sketch."""

@@ -65,8 +65,23 @@ def _profile(s: Session, sketch_index: int = 0):
     try:
         return sk, sk.Profiles.AddForSolid()
     except Exception as e:
-        raise InventorError(f"sketch {sk.Name} has no closed profile — close the outline "
-                            f"(draw_closed_profile, draw_rectangle...)") from e
+        from .sketch import sketch_problems
+        p = safe(lambda: sketch_problems(sk), {}) or {}
+        detail = []
+        if p.get("open_ends"):
+            detail.append("open ends at " + ", ".join(f"{o['curve']} ({o['at_mm'][0]:g}, {o['at_mm'][1]:g})"
+                                                      for o in p["open_ends"][:6]))
+        if p.get("gaps"):
+            detail.append("gaps " + ", ".join(f"{g['gap_mm']:g} mm between {g['between'][0]} and {g['between'][1]}"
+                                              for g in p["gaps"][:4]))
+        if p.get("three_way_junctions"):
+            detail.append(f"{len(p['three_way_junctions'])} point(s) where three or more curves meet")
+        if p.get("drawn_twice"):
+            detail.append("lines drawn twice: " + ", ".join(" & ".join(d) for d in p["drawn_twice"][:4]))
+        raise InventorError(f"sketch {sk.Name} has no closed profile"
+                            + (": " + "; ".join(detail) if detail else "")
+                            + ". Close the outline (draw_line across a gap, or draw_closed_profile / draw_rectangle); "
+                            "check_sketch lists the problems") from e
 
 
 @tool("features")

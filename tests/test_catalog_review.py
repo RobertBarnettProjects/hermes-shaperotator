@@ -219,3 +219,8 @@ def test_quoted_yield_strength_is_not_an_unbacked_stress():
     assert not any(c.quantity == "stress_MPa" for c in out)
     out = verify.check("Peak stress is 180 MPa.", [])
     assert any(c.quantity == "stress_MPa" and c.status == "unsupported" for c in out)
+
+
+def test_answering_an_inventor_dialog_needs_approval(job):
+    out = P._pre_tool_call(tool_name="cad_native", args={"tool": "answer_dialog", "args": {"button": "Yes"}})
+    assert out and out["action"] == "approve" and "'Yes'" in out["message"]

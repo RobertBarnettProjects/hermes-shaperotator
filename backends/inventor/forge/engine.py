@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import time
 from concurrent.futures import TimeoutError as FutureTimeout
 import traceback
@@ -25,7 +26,23 @@ def _plain(v: Any) -> Any:
 
 
 RPC_BUSY = (-2147418111, -2147417846)     # RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER
-DEFAULT_WAIT = 1800.0                     # s: how long a call may hold the COM thread, unless the tool says otherwise
+DEFAULT_WAIT = 1800.0
+DIALOG_GRACE = 12.0       # s a call may run before an Inventor dialog that appeared meanwhile is reported
+
+
+def read_only() -> bool:
+    return os.environ.get("INVENTOR_FORGE_READ_ONLY", "").strip().lower() in ("1", "true", "yes")
+
+
+def tool_enabled(t) -> bool:
+    """INVENTOR_FORGE_TOOLSETS=sketch,features,... limits the server to those tool groups (system always on)."""
+    sets = [x.strip().lower() for x in os.environ.get("INVENTOR_FORGE_TOOLSETS", "").split(",") if x.strip()]
+    return not sets or t.group in sets or t.group in ("system", "session")
+
+
+def _dialog_text(dialogs) -> str:
+    return "; ".join(f"'{d.get('title', '')}'" + (f" says \"{d['text']}\"" if d.get("text") else "")
+                     + (f" [buttons: {', '.join(d['buttons'])}]" if d.get("buttons") else "") for d in dialogs or [])                     # s: how long a call may hold the COM thread, unless the tool says otherwise
 BATCH_ARGS = {"cases": None, "fractions": 3}   # list arguments that repeat a tool's own timeout (default count)
 
 
@@ -59,11 +76,16 @@ class Forge:
         self.apartment = Apartment()
         self.session = Session(visible=visible)
         self.tools = TOOLS
+        self.pending: dict | None = None          # a call left waiting on Inventor (a dialog, or too slow)
+        self.session.forge = self
 
     def call(self, name: str, args: dict | None = None, timeout: float | None = DEFAULT_WAIT) -> dict:
         t = self.tools.get(name)
-        if t is None:
-            raise InventorError(f"unknown tool {name!r}")
+        if t is None or not tool_enabled(t):
+            raise InventorError(f"unknown tool {name!r}" if t is None else
+                                f"{name} is switched off here ({os.environ.get('INVENTOR_FORGE_TOOLSETS', '')!r} toolsets)")
+        if t.mutates and read_only():
+            raise InventorError(f"{name} changes the model, and this server runs read-only (INVENTOR_FORGE_READ_ONLY)")
         args = dict(args or {})
         params = list(inspect.signature(t.fn).parameters)[1:]
         unknown = [k for k in args if k not in params]
@@ -111,11 +133,41 @@ class Forge:
             return _plain(out) if isinstance(out, dict) else {"result": _plain(out)}
 
         wait = call_budget(t.fn, args, timeout)
-        try:
-            return self.apartment.run(run, timeout=wait)
-        except FutureTimeout:
-            raise InventorError(f"{name}: no answer after {wait:.0f} s. The call may still be running in Inventor (a solve "
-                                "carries on regardless); check solve_state before calling anything else") from None
+        if self.pending is not None and not self.pending["future"].done():
+            raise InventorError(f"an earlier call ({self.pending['tool']}) is still waiting on Inventor"
+                                + (f", which shows a dialog: {_dialog_text(self.pending.get('dialogs'))}" if self.pending.get("dialogs") else "")
+                                + ". Use pending_call to see it, answer_dialog to answer it, or wait")
+        pid = self.session.pid
+        before = set()
+        if pid and t.group != "analysis":             # analysis tools drive their own dialogs
+            try:
+                from . import uidrive as U
+                before = {r_["hwnd"] for r_ in U.dialog_rows(pid)}
+            except Exception:  # noqa: BLE001
+                pid = None
+        fut = self.apartment.submit(run)
+        t0 = time.time()
+        while True:
+            try:
+                return fut.result(timeout=min(2.0, max(0.1, t0 + wait - time.time())))
+            except FutureTimeout:
+                pass
+            if time.time() - t0 >= wait:
+                self.pending = {"tool": name, "future": fut, "started": t0, "dialogs": []}
+                raise InventorError(f"{name}: no answer after {wait:.0f} s. The call may still be running in Inventor (a "
+                                    "solve carries on regardless); check solve_state or pending_call before calling "
+                                    "anything else") from None
+            if pid and t.group != "analysis" and time.time() - t0 >= DIALOG_GRACE:
+                try:
+                    from . import uidrive as U
+                    dialogs = U.dialog_rows(pid, skip=before) if U.modal_blocked(pid) else []
+                except Exception:  # noqa: BLE001
+                    dialogs = []
+                if dialogs:
+                    self.pending = {"tool": name, "future": fut, "started": t0, "dialogs": dialogs}
+                    raise InventorError(f"{name}: Inventor is waiting on a dialog and the call can't finish until it is "
+                                        f"answered: {_dialog_text(dialogs)}. Answer it with answer_dialog(button=...) "
+                                        "(or ask the user to), then pending_call shows the call's result")
 
     def safe_call(self, name: str, args: dict | None = None) -> dict:
         """Never raises: {"ok": False, "error": ...} on failure."""

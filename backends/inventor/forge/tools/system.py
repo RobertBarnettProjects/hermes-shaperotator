@@ -7,11 +7,75 @@ import io
 import sys
 import traceback
 
-from ..com import MM, K, items, typed_call
+from ..com import MM, InventorError, K, items, late, typed_call
 from ..registry import TOOLS, tool
 from ..session import Session
 
 _NS: dict = {}
+
+
+def _log_snippet(s: Session, code: str, outcome: str) -> None:
+    """Append what ran to execute_python.log (time, SHA-256 of the code, outcome, the code), for the audit trail."""
+    import hashlib
+    import os
+    import time as _t
+    try:
+        os.makedirs(s.workdir, exist_ok=True)
+        with open(os.path.join(s.workdir, "execute_python.log"), "a", encoding="utf-8") as f:
+            f.write(f"--- {_t.strftime('%Y-%m-%d %H:%M:%S')} sha256={hashlib.sha256(code.encode()).hexdigest()} "
+                    f"{outcome}\n{code}\n")
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- calls held up by a dialog
+@tool("system", mutates=False, com=False)
+def pending_call(s: Session, wait_seconds: float = 0.0) -> dict:
+    """The call that came back early because Inventor showed a dialog (or took too long): whether it has finished
+    now, its result or error, and any dialog Inventor still shows. Reads windows only, so it works while Inventor
+    is blocked.
+
+    wait_seconds: wait up to this long for it to finish first
+    """
+    import concurrent.futures as cf
+    import time as _t
+    forge = getattr(s, "forge", None)
+    p = getattr(forge, "pending", None)
+    if not p:
+        return {"pending": False}
+    fut = p["future"]
+    try:
+        res = fut.result(timeout=max(0.0, float(wait_seconds)))
+    except cf.TimeoutError:
+        from .. import uidrive as U
+        dialogs = U.dialog_rows(s.pid) if s.pid else []
+        return {"pending": True, "tool": p["tool"], "running_s": round(_t.time() - p["started"], 1),
+                "dialogs": [{k: d[k] for k in ("title", "text", "buttons")} for d in dialogs]}
+    except Exception as e:  # noqa: BLE001
+        forge.pending = None
+        return {"pending": False, "tool": p["tool"], "finished": True, "error": str(e)}
+    forge.pending = None
+    return {"pending": False, "tool": p["tool"], "finished": True, "result": res}
+
+
+@tool("system", com=False)
+def answer_dialog(s: Session, button: str, title: str = "") -> dict:
+    """Press a button on an Inventor dialog that is holding up a call (pending_call lists them), with a window
+    message, not the mouse. Only use a button the user would agree to: ask them when it matters (e.g. "Save").
+
+    button: the button's label as listed (OK, Cancel, Yes, No...)
+    title: which dialog, when more than one is open (default: the first)
+    """
+    from .. import uidrive as U
+    if not s.pid:
+        raise InventorError("not connected to an Inventor")
+    dialogs = [d for d in U.dialog_rows(s.pid) if not title or title.lower() in d["title"].lower()]
+    if not dialogs:
+        raise InventorError("Inventor shows no dialog" + (f" titled like {title!r}" if title else ""))
+    d = dialogs[0]
+    if not U.press_dialog_button(d["hwnd"], button):
+        raise InventorError(f"dialog '{d['title']}' has no button {button!r}; its buttons are {d['buttons']}")
+    return {"pressed": button, "dialog": d["title"], "text": d["text"]}
 
 
 # --------------------------------------------------------------------------- standards
@@ -54,12 +118,17 @@ def get_standard(s: Session) -> dict:
 
 
 @tool("system")
-def execute_python(s: Session, code: str) -> dict:
+def execute_python(s: Session, code: str, undo_on_error: bool = True) -> dict:
     """Run Python in a persistent namespace with the live Inventor objects: app, doc, cdef (component
     definition or None), tg (TransientGeometry), to (TransientObjects), K (all Inventor enum constants),
     items(collection), typed_call(obj, method, ...) for [out]-parameter methods, MM (=0.1, mm->cm).
     Inventor API units are cm and radians. The value of a final expression is returned; print() output too.
-    Use it for anything the dedicated tools don't cover.
+    Use it for anything the dedicated tools don't cover. Every snippet is logged (time, SHA-256, outcome) to
+    execute_python.log in the workdir.
+
+    undo_on_error: run inside one undo step and roll the document back if the code raises (default true)
+    Don't run Inventor commands synchronously here (ControlDefinition.Execute2(True)): one that opens a dialog
+    holds the whole server until someone answers it. Use Execute2(False), or the dedicated tools.
     """
     app = s.app
     # the session's working document (brought to the front, so code using app.ActiveDocument agrees), else the active one
@@ -74,6 +143,12 @@ def execute_python(s: Session, code: str) -> dict:
                 "K": K, "items": items, "typed_call": typed_call, "MM": MM, "session": s})
     buf = io.StringIO()
     result = None
+    txn = None
+    if undo_on_error and doc is not None:
+        try:
+            txn = app.TransactionManager.StartTransaction(doc, "execute_python")
+        except Exception:
+            txn = None
     try:
         import ast
         tree = ast.parse(code, mode="exec")
@@ -85,7 +160,25 @@ def execute_python(s: Session, code: str) -> dict:
             else:
                 exec(compile(tree, "<forge>", "exec"), _NS)
     except Exception:
-        return {"ok_python": False, "stdout": buf.getvalue()[-4000:], "error": traceback.format_exc(limit=6)[-3000:]}
+        rolled = False
+        if txn is not None:
+            try:
+                txn.Abort()
+                rolled = True
+            except Exception:
+                pass
+        # the traceback from the snippet's own lines, not the server's
+        tb = traceback.format_exc(limit=8)
+        lines = [ln for ln in tb.splitlines() if "inventor_forge" not in ln]
+        _log_snippet(s, code, "error")
+        return {"ok_python": False, "stdout": buf.getvalue()[-4000:], "error": "\n".join(lines)[-3000:],
+                "rolled_back": rolled}
+    if txn is not None:
+        try:
+            txn.End()
+        except Exception:
+            pass
+    _log_snippet(s, code, "ok")
     out = {"ok_python": True, "stdout": buf.getvalue()[-8000:]}
     if result is not None:
         try:

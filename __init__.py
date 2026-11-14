@@ -100,6 +100,12 @@ def _pre_tool_call(tool_name: str = "", args: Any = None, **kw: Any):
 
 
 def _pre_tool_call_inner(tool_name: str = "", args: Any = None, **_: Any):
+    if tool_name == "cad_native" and isinstance(args, dict) and args.get("tool") == "answer_dialog":
+        ta = args.get("args") if isinstance(args.get("args"), dict) else {}
+        return {"action": "approve",
+                "message": f"hermes-shaperotator wants to press '{ta.get('button', '?')}' on an Inventor dialog"
+                           + (f" ('{ta['title']}')" if ta.get("title") else "")
+                           + ". Approve only if that is the answer you want (e.g. not 'Don't save' on unsaved work)."}
     if tool_name == "cad_python" or (tool_name == "cad_native" and _native_executes_code(args)):
         code = str((args or {}).get("code", args) if isinstance(args, dict) else "")
         preview = code if len(code) <= 1200 else code[:1200] + "\n... (truncated)"

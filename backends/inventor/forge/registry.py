@@ -75,6 +75,12 @@ def _parse_doc(doc: str) -> tuple[str, dict[str, str]]:
     return desc, params
 
 
+# tools whose effect can't be undone from inside Inventor, or that throw work away (MCP destructiveHint)
+DESTRUCTIVE = {"close_document", "close_private_inventor", "delete_study_item", "delete_feature", "save_document",
+               "export_document", "export_pdf", "execute_python", "answer_dialog", "set_active_project", "undo",
+               "run_study_cases", "bill_of_materials", "flat_pattern"}
+
+
 def tool(group: str, name: str | None = None, mutates: bool = True, com: bool = True):
     def deco(fn):
         sig = inspect.signature(fn)

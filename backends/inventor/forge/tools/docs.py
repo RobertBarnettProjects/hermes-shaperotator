@@ -487,11 +487,34 @@ def set_view(s: Session, view: str = "iso", fit: bool = True) -> dict:
 
 
 @tool("view", mutates=False)
-def screenshot(s: Session, path: str = "", view: str = "", width: int = 1600, height: int = 1000) -> dict:
-    """Save a PNG of the active document's view (model or drawing sheet) — look at it to check your work.
+def screenshot(s: Session, path: str = "", view: str = "", width: int = 1600, height: int = 1000,
+               views: str = "") -> dict:
+    """Save a PNG of the active document's view (model or drawing sheet) — look at it to check your work. Each
+    image comes with its scale (mm per pixel) so sizes on it can be read off. With views, one PNG per orientation
+    in a single call, and the user's camera is put back afterwards.
 
     view: optional orientation first (iso, front, top, ...); empty keeps the current camera
+    views: several orientations at once, e.g. "iso,front,top,right" (path is then a folder or a name prefix)
     """
+    if views:
+        wanted = [w.strip() for w in views.split(",") if w.strip()]
+        v = s.view()
+        cam = v.Camera if v is not None else None
+        keep = None
+        if cam is not None:
+            keep = (cam.Eye, cam.Target, cam.UpVector, safe(lambda: cam.Perspective, False))
+        stem = path or f"views-{int(time.time() * 1000)}"
+        shots = []
+        try:
+            for w in wanted:
+                p_ = stem + f"-{w}.png" if not stem.lower().endswith(".png") else stem[:-4] + f"-{w}.png"
+                shots.append({"view": w, **screenshot(s, path=p_, view=w, width=width, height=height)})
+        finally:
+            if keep is not None:
+                safe(lambda: (setattr(cam, "Eye", keep[0]), setattr(cam, "Target", keep[1]),
+                              setattr(cam, "UpVector", keep[2]), setattr(cam, "Perspective", keep[3]),
+                              cam.ApplyWithoutTransition()))
+        return {"images": shots}
     if view:
         set_view(s, view=view)
     v = s.view()
@@ -507,7 +530,19 @@ def screenshot(s: Session, path: str = "", view: str = "", width: int = 1600, he
         v.Camera.SaveAsBitmap(path, int(width), int(height), white, white)
     except Exception:
         v.SaveAsBitmap(path, int(width), int(height))
-    return {"path": path, "width": width, "height": height}
+    out = {"path": path, "width": width, "height": height}
+    if s.kind(s.doc()) != "drawing":                    # model views: how big a pixel is, for reading sizes off
+        try:
+            from ..com import typed_call
+            ext = typed_call(v.Camera, "GetExtents", 0.0, 0.0)
+            w_cm, h_cm = float(ext[-2]), float(ext[-1])
+            mmpx = max(w_cm * 10 / int(width), h_cm * 10 / int(height))
+            out["mm_per_px"] = round(mmpx, 4)
+            out["note"] = "orthographic camera: sizes read off the image are true at mm_per_px" if not \
+                safe(lambda: v.Camera.Perspective, False) else "perspective camera: mm_per_px holds at the target only"
+        except Exception:
+            pass
+    return out
 
 
 @tool("session")
