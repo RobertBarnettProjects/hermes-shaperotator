@@ -210,7 +210,11 @@ def activate_sheet(s: Session, sheet: str) -> dict:
 @tool("drawing")
 def add_base_view(s: Session, model: str = "", x: float = 120.0, y: float = 170.0, scale: float = 1.0,
                   orientation: str = "front", style: str = "visible", name: str = "") -> dict:
-    """Base view of a part/assembly (file path or open document name) centred at (x, y) sheet mm.
+    """Base view of a part/assembly (file path or open document name) centred at (x, y) sheet mm. One base view per
+    model per sheet: once the sheet has an orthographic view of a model, its other orthographic views (top, right,
+    left...) must be projected from it with add_projected_view, which orients and aligns them by the sheet's
+    projection angle. A second base view in Inventor's named orientations comes out wrong for models that aren't
+    Y-up (a "right" view of a Z-up kart is the plan turned on its side), so it is refused. Isometric views are fine.
 
     scale: e.g. 0.5 for 1:2, 2 for 2:1
     orientation: front | top | right | left | back | bottom | iso | iso_left
@@ -218,6 +222,15 @@ def add_base_view(s: Session, model: str = "", x: float = 120.0, y: float = 170.
     """
     sh = _sheet(s)
     md = _model_doc(s, model)
+    o = orientation.lower()
+    if not o.startswith("iso"):
+        existing = _ortho_base_views(sh, md)
+        if existing:
+            raise InventorError(
+                f"this sheet already has a base view of {md.DisplayName} ({existing[0].Name}); add the {o} view with "
+                f"add_projected_view(parent={existing[0].Name!r}, x, y) placed on the side the projection angle puts it "
+                "(third angle: right view to the right of FRONT, top view above). A separate base view isn't aligned "
+                "with the others and can be mis-oriented")
     v = sh.DrawingViews.AddBaseView(md, s.tg.CreatePoint2d(x * MM, y * MM), float(scale),
                                     getattr(K, ORIENT[orientation.lower()]), getattr(K, STYLES[style.lower()]))
     if name:
@@ -1803,6 +1816,25 @@ def _overlap(a, b, pad=0.0) -> bool:
     return a[0] < b[2] - pad and b[0] < a[2] - pad and a[1] < b[3] - pad and b[1] < a[3] - pad
 
 
+def _is_iso_view(v) -> bool:
+    o = K.name_of(safe(lambda: v.Camera.ViewOrientationType, 0), "k")
+    return "Iso" in o or str(safe(lambda: v.Name, "")).upper().startswith("ISO")
+
+
+def _ortho_base_views(sh, md) -> list:
+    """Orthographic base (not projected) views of this model on the sheet."""
+    key = safe(lambda: md.FullFileName, "") or safe(lambda: md.DisplayName, "")
+    out = []
+    for v in items(sh.DrawingViews):
+        if safe(lambda v=v: v.ViewType) != K.kStandardDrawingViewType or _is_iso_view(v):
+            continue
+        ref = safe(lambda v=v: v.ReferencedDocumentDescriptor.ReferencedDocument)
+        rk = (safe(lambda: ref.FullFileName, "") or safe(lambda: ref.DisplayName, "")) if ref is not None else ""
+        if rk == key:
+            out.append(v)
+    return out
+
+
 @tool("drawing", mutates=False)
 def check_drawing(s: Session) -> dict:
     """QA of every sheet: views overlapping each other / the title block / the sheet edge, views
@@ -1818,6 +1850,18 @@ def check_drawing(s: Session) -> dict:
         boxes = [(v.Name, _lbox(v)) for v in views]
         if not views:
             issues.append(f"[{sh.Name}] sheet has no views")
+        seen_models: dict = {}
+        for v in views:                               # every orthographic view but the first is projected from it
+            if safe(lambda v=v: v.ViewType) != K.kStandardDrawingViewType or _is_iso_view(v):
+                continue
+            ref = safe(lambda v=v: v.ReferencedDocumentDescriptor.ReferencedDocument)
+            rk = (safe(lambda: ref.FullFileName, "") or safe(lambda: ref.DisplayName, "")) if ref is not None else ""
+            if rk in seen_models:
+                issues.append(f"[{sh.Name}] view {v.Name} is a second base view of the model shown in "
+                              f"{seen_models[rk]}: it isn't projected, so it may be mis-oriented or out of line. "
+                              f"Delete it and add it with add_projected_view(parent={seen_models[rk]!r}, ...)")
+            else:
+                seen_models[rk] = v.Name
         for i, (n1, b1) in enumerate(boxes):
             if b1[0] < 10 or b1[1] < 10 or b1[2] > W - 10 or b1[3] > H - 10:
                 issues.append(f"[{sh.Name}] view {n1} runs outside the border area")
