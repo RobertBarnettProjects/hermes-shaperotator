@@ -12,6 +12,31 @@ DOC_KIND = {"kPartDocumentObject": "part", "kAssemblyDocumentObject": "assembly"
             "kDrawingDocumentObject": "drawing", "kPresentationDocumentObject": "presentation"}
 
 
+def restore_environment() -> list[str]:
+    """Put back the standard Windows variables a client stripped from this server's environment.
+
+    Some MCP clients start servers with a trimmed environment (no COMPUTERNAME, ALLUSERSPROFILE, COMMONPROGRAMFILES
+    and so on). An Inventor that COM starts from such a process inherits it and dies at start-up with a licensing
+    error ("Server execution failed"). Variables already set are left alone; only missing ones are added, from the
+    user's own environment as Windows would build it at log-on. Returns the names added."""
+    try:
+        import win32api
+        import win32con
+        import win32profile
+        import win32security
+        token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+        full = win32profile.CreateEnvironmentBlock(token, False)
+    except Exception:
+        return []
+    have = {k.upper() for k in os.environ}
+    added = []
+    for k, v in full.items():
+        if k and not k.startswith("=") and k.upper() not in have:
+            os.environ[k] = v
+            added.append(k)
+    return added
+
+
 @dataclass
 class Snapshot:
     volume: float = 0.0
@@ -62,6 +87,7 @@ class Session:
         try:
             raw = wc.GetActiveObject("Inventor.Application")
         except Exception:
+            restore_environment()        # a new Inventor inherits this environment: it must be a complete one
             raw = wc.DispatchEx("Inventor.Application")
         app = late(raw)          # always late-bound, method results included: predictable across machines
         try:
@@ -88,6 +114,7 @@ class Session:
         if self.private and self._app is not None:
             return self.app
         before = set(pids_named("Inventor.exe"))
+        restore_environment()            # a new Inventor inherits this environment: it must be a complete one
         raw = wc.DispatchEx("Inventor.Application")
         t0 = time.time()
         while not set(pids_named("Inventor.exe")) - before and time.time() - t0 < 120:
