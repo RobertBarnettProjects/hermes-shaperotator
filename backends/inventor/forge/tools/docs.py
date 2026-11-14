@@ -604,16 +604,51 @@ def set_view(s: Session, view: str = "iso", fit: bool = True) -> dict:
     return {"view": view}
 
 
+# Z-up orientations (3D printing, most STEP/STL from other tools): where the eye sits relative to the model, and
+# which way is up on screen. Inventor's own orientations are Y-up.
+_Z_UP = {"iso": ((1, -1, 1), (0, 0, 1)), "iso_left": ((-1, -1, 1), (0, 0, 1)),
+         "iso_bottom": ((1, -1, -1), (0, 0, 1)), "front": ((0, -1, 0), (0, 0, 1)), "back": ((0, 1, 0), (0, 0, 1)),
+         "top": ((0, 0, 1), (0, 1, 0)), "bottom": ((0, 0, -1), (0, -1, 0)), "left": ((-1, 0, 0), (0, 0, 1)),
+         "right": ((1, 0, 0), (0, 0, 1))}
+
+
+def _aim_z_up(s: Session, view: str) -> None:
+    """Point the active camera for a Z-up model: eye along the view's direction from the model's centre."""
+    if view not in _Z_UP:
+        raise InventorError(f"with up='z' the views are {', '.join(_Z_UP)}; {view!r} isn't one")
+    d = s.doc()
+    rb = safe(lambda: d.ComponentDefinition.RangeBox)
+    if rb is None:
+        raise InventorError("up='z' needs a part or assembly with geometry")
+    lo, hi = rb.MinPoint, rb.MaxPoint
+    c = ((lo.X + hi.X) / 2, (lo.Y + hi.Y) / 2, (lo.Z + hi.Z) / 2)
+    size = max(hi.X - lo.X, hi.Y - lo.Y, hi.Z - lo.Z, 0.1)
+    (ex, ey, ez), (ux, uy, uz) = _Z_UP[view]
+    n = (ex * ex + ey * ey + ez * ez) ** 0.5
+    cam = s.view().Camera
+    cam.Perspective = False
+    cam.Target = s.tg.CreatePoint(*c)
+    cam.Eye = s.tg.CreatePoint(c[0] + ex / n * size * 4, c[1] + ey / n * size * 4, c[2] + ez / n * size * 4)
+    cam.UpVector = s.tg.CreateUnitVector(ux, uy, uz)
+    cam.Fit()
+    cam.ApplyWithoutTransition()
+
+
 @tool("view", mutates=False)
 def screenshot(s: Session, path: str = "", view: str = "", width: int = 1600, height: int = 1000,
-               views: str = "") -> dict:
+               views: str = "", up: str = "y") -> dict:
     """Save a PNG of the active document's view (model or drawing sheet) — look at it to check your work. Each
     image comes with its scale (mm per pixel) so sizes on it can be read off. With views, one PNG per orientation
     in a single call, and the user's camera is put back afterwards.
 
     view: optional orientation first (iso, front, top, ...); empty keeps the current camera
     views: several orientations at once, e.g. "iso,front,top,right" (path is then a folder or a name prefix)
+    up: "y" (Inventor's convention) or "z" for models built Z-up, such as parts laid out on a 3D printer's bed:
+        top then looks down Z and iso has Z pointing up
     """
+    up = (up or "y").strip().lower()
+    if up not in ("y", "z"):
+        raise InventorError("up must be 'y' or 'z'")
     if views:
         wanted = [w.strip() for w in views.split(",") if w.strip()]
         v = s.view()
@@ -636,14 +671,16 @@ def screenshot(s: Session, path: str = "", view: str = "", width: int = 1600, he
             for w in wanted:
                 p_ = (os.path.join(base, f"view-{w}.png") if is_dir else
                       (base[:-4] if base.lower().endswith(".png") else base) + f"-{w}.png")
-                shots.append({"view": w, **screenshot(s, path=p_, view=w, width=width, height=height)})
+                shots.append({"view": w, **screenshot(s, path=p_, view=w, width=width, height=height, up=up)})
         finally:
             if keep is not None:
                 safe(lambda: (setattr(cam, "Eye", keep[0]), setattr(cam, "Target", keep[1]),
                               setattr(cam, "UpVector", keep[2]), setattr(cam, "Perspective", keep[3]),
                               cam.ApplyWithoutTransition()))
         return {"images": shots}
-    if view:
+    if view and up == "z" and s.kind(s.doc()) != "drawing":
+        _aim_z_up(s, view.strip().lower())
+    elif view:
         set_view(s, view=view)
     v = s.view()
     if v is None:
