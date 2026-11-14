@@ -139,6 +139,7 @@ def create_drawing(s: Session, standard: str = "", sheet_size: str = "A3", orien
                         safe(lambda ds=ds, a2=attr2: setattr(ds, a2, K.kInlineHorizontalDimensionText))
     sh = d.ActiveSheet
     _resize(sh, sheet_size, orientation)
+    _set_custom(d, STANDARD_PROP, k)
     if name:
         safe(lambda: setattr(d, "DisplayName", name))
     return {"drawing": d.DisplayName, "standard": standard, "template": os.path.basename(tpl) if tpl else "",
@@ -148,6 +149,66 @@ def create_drawing(s: Session, standard: str = "", sheet_size: str = "A3", orien
                            "with the standard's projection and dimension style"}
                if os.path.basename(tpl or "") != want else {}),
             **({"note": spec["note"]} if spec.get("note") else {})}
+
+
+STANDARD_PROP = "Drafting standard"
+
+
+def _set_custom(d, name: str, value: str) -> None:
+    props = safe(lambda: d.PropertySets.Item("Inventor User Defined Properties"))
+    if props is None:
+        return
+    cur = safe(lambda: props.Item(name))
+    if cur is not None:
+        safe(lambda: setattr(cur, "Value", value))
+    else:
+        safe(lambda: props.Add(value, name))
+
+
+def _get_custom(d, name: str) -> str:
+    return str(safe(lambda: d.PropertySets.Item("Inventor User Defined Properties").Item(name).Value, "") or "")
+
+
+def _standard_note(s: Session, standard: str) -> dict:
+    """The block of general notes the standard expects, just left of the title block, moved up out of the way of
+    anything it would sit on: units, general tolerance, projection angle and the drawing standard."""
+    from ..standards import STANDARDS, key
+    spec = STANDARDS[key(standard)]
+    units = "INCHES" if getattr(s, "drawing_units", "mm") == "in" and key(standard) == "ASME" else "mm"
+    lines = ["UNLESS OTHERWISE STATED:", f"DIMENSIONS IN {units}",
+             f"GENERAL TOLERANCES: {spec['general_tolerance'].upper()}",
+             f"{spec['projection'].upper()} ANGLE PROJECTION", f"DRAWN TO {spec['drawing'].split(',')[0].upper()}"]
+    sh = _sheet(s)
+    for n in items(sh.DrawingNotes.GeneralNotes):        # one per sheet
+        if "GENERAL TOLERANCES" in str(safe(lambda n=n: n.Text, "")):
+            safe(lambda n=n: n.Delete())
+    tb = safe(lambda: sh.TitleBlock.RangeBox)
+    x0 = (tb.MinPoint.X * 10 - 4) if tb is not None else sh.Width * 10 - 200
+    y0 = (tb.MinPoint.Y * 10 + 2) if tb is not None else 20
+    text = "<Br/>".join(lines)
+    note = sh.DrawingNotes.GeneralNotes.AddFitted(s.tg.CreatePoint2d(x0 * MM, y0 * MM), text)
+    rb = note.RangeBox
+    w, h = (rb.MaxPoint.X - rb.MinPoint.X) * 10, (rb.MaxPoint.Y - rb.MinPoint.Y) * 10
+    blockers = [_lbox(v) for v in items(sh.DrawingViews)]
+    blockers += [(q.RangeBox.MinPoint.X * 10, q.RangeBox.MinPoint.Y * 10, q.RangeBox.MaxPoint.X * 10,
+                  q.RangeBox.MaxPoint.Y * 10) for q in items(sh.PartsLists)]
+    for q in items(sh.SketchedSymbols):                 # symbols: their box if Inventor gives one, else a margin
+        rb_ = safe(lambda q=q: q.RangeBox)
+        if rb_ is not None:
+            blockers.append((rb_.MinPoint.X * 10 - 2, rb_.MinPoint.Y * 10 - 2, rb_.MaxPoint.X * 10 + 2, rb_.MaxPoint.Y * 10 + 2))
+        else:
+            pos = safe(lambda q=q: q.Position)
+            if pos is not None:
+                blockers.append((pos.X * 10 - 30, pos.Y * 10 - 15, pos.X * 10 + 30, pos.Y * 10 + 15))
+    # candidate spots: left of the title block along the bottom, then up the left-hand side of the sheet
+    spots = [(x0 - w - k * 10, y0 + h) for k in range(0, 30)] + [(15, 15 + h + k * 10) for k in range(0, 30)]
+    for x, ytop in spots:
+        box = (x, ytop - h, x + w, ytop)
+        if x < 12 or box[1] < 12 or not any(_overlap(box, b, 2) for b in blockers):
+            if x >= 12 and box[1] >= 12:
+                note.Position = s.tg.CreatePoint2d(x * MM, ytop * MM)
+                return {"note": lines}
+    return {"note": lines, "warning": "no clear spot for the general notes; move them with the note tools"}
 
 
 def _third(standard: str) -> bool:
@@ -1531,8 +1592,8 @@ def make_part_sheet(s: Session, model: str = "", views: str = "front,top,right,i
                                 ("drawn_by", drawn_by), ("material", material or safe(
                                     lambda: md.ActiveMaterial.DisplayName, ""))) if v}
     set_title_block_field(s, fields)
-    if third:
-        safe(lambda: add_projection_symbol(s))
+    safe(lambda: add_projection_symbol(s, third_angle=third))
+    safe(lambda: _standard_note(s, standard))
     return {"scale": _scale_text(lay["scale"]), "views": [m["name"] for m in lay["views"]], **steps,
             "qa": check_drawing(s)}
 
@@ -1677,8 +1738,8 @@ def make_assembly_sheet(s: Session, model: str = "", scale: float = 0.0, sheet_s
     place_view_labels(s)
     set_title_block_field(s, {k: v for k, v in (("title", title or md.DisplayName.split(".")[0].upper()),
                                                 ("drawing_number", drawing_number), ("drawn_by", drawn_by)) if v})
-    if third:
-        safe(lambda: add_projection_symbol(s))
+    safe(lambda: add_projection_symbol(s, third_angle=third))
+    safe(lambda: _standard_note(s, standard))
     return {"scale": _scale_text(lay["scale"]), "sheet": sheet_size, "up": u, "parts_list_rows": pl["rows"], "balloons": bl["balloons"],
             "qa": check_drawing(s)}
 
@@ -1816,6 +1877,38 @@ def _overlap(a, b, pad=0.0) -> bool:
     return a[0] < b[2] - pad and b[0] < a[2] - pad and a[1] < b[3] - pad and b[1] < a[3] - pad
 
 
+ANSI_SIZES = {"kADrawingSheetSize", "kBDrawingSheetSize", "kCDrawingSheetSize", "kDDrawingSheetSize",
+              "kEDrawingSheetSize"}
+ISO_SIZES = {"kA0DrawingSheetSize", "kA1DrawingSheetSize", "kA2DrawingSheetSize", "kA3DrawingSheetSize",
+             "kA4DrawingSheetSize"}
+
+
+def _standard_issues(s: Session, d, sh, std_key: str) -> list[str]:
+    """Where a drawing made to a standard has drifted from it: projection angle, sheet series, general notes."""
+    from ..standards import STANDARDS
+    spec = STANDARDS.get(std_key)
+    if spec is None:
+        return []
+    out = []
+    first = safe(lambda: bool(d.StylesManager.ActiveStandardStyle.FirstAngleProjection))
+    if first is not None and first != (spec["projection"] == "first"):
+        out.append(f"[{sh.Name}] projection is {'first' if first else 'third'} angle, but {std_key} uses "
+                   f"{spec['projection']} angle")
+    size = K.name_of(safe(lambda: sh.Size, 0), "k")
+    if std_key == "ASME" and size in ISO_SIZES:
+        out.append(f"[{sh.Name}] sheet is an ISO A size; ASME drawings use ANSI A-E sheets")
+    if std_key != "ASME" and size in ANSI_SIZES:
+        out.append(f"[{sh.Name}] sheet is an ANSI size; {std_key} drawings use ISO A0-A4 sheets")
+    notes = " ".join(str(safe(lambda n=n: n.Text, "")) for n in items(sh.DrawingNotes.GeneralNotes)).upper()
+    if "GENERAL TOLERANCE" not in notes and "TOLERANCES" not in notes:
+        out.append(f"[{sh.Name}] no general tolerance note ({spec['general_tolerance']}); add_general_notes")
+    syms = [str(safe(lambda q=q: q.Definition.Name, "")) for q in items(sh.SketchedSymbols)]
+    want = "Third angle projection" if spec["projection"] == "third" else "First angle projection"
+    if want not in syms:
+        out.append(f"[{sh.Name}] no {spec['projection']}-angle projection symbol; add_projection_symbol")
+    return out
+
+
 def _is_iso_view(v) -> bool:
     o = K.name_of(safe(lambda: v.Camera.ViewOrientationType, 0), "k")
     return "Iso" in o or str(safe(lambda: v.Name, "")).upper().startswith("ISO")
@@ -1850,6 +1943,9 @@ def check_drawing(s: Session) -> dict:
         boxes = [(v.Name, _lbox(v)) for v in views]
         if not views:
             issues.append(f"[{sh.Name}] sheet has no views")
+        std_key = _get_custom(d, STANDARD_PROP)
+        if std_key:
+            issues += _standard_issues(s, d, sh, std_key)
         seen_models: dict = {}
         for v in views:                               # every orthographic view but the first is projected from it
             if safe(lambda v=v: v.ViewType) != K.kStandardDrawingViewType or _is_iso_view(v):

@@ -275,6 +275,33 @@ def _release_path(s: Session, d, path: str) -> None:
                                 "close it first or save under a different name")
 
 
+def protected_roots() -> list[str]:
+    """Folders a model must never be written into: Autodesk's libraries, templates and install folders, and any the
+    user lists in INVENTOR_FORGE_PROTECTED (separated by ';')."""
+    import glob
+    roots = []
+    public = os.path.join(os.environ.get("PUBLIC", r"C:\Users\Public"), "Documents", "Autodesk")
+    for inv in glob.glob(os.path.join(public, "Inventor *")):      # library folders only, not the project workspace
+        roots += [os.path.join(inv, sub) for sub in ("Templates", "Design Data", "Content Center Files")]
+    for env in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"):
+        v = os.environ.get(env)
+        if v:
+            roots.append(os.path.join(v, "Autodesk"))
+    roots += [x for x in os.environ.get("INVENTOR_FORGE_PROTECTED", "").split(";") if x.strip()]
+    return [os.path.normcase(os.path.realpath(r_)) for r_ in roots]
+
+
+def _guard_write(path: str, what: str = "save") -> None:
+    """Refuse to write into a protected folder or over a read-only file."""
+    rp = os.path.normcase(os.path.realpath(path))
+    for root in protected_roots():
+        if rp == root or rp.startswith(root.rstrip("\\/") + os.sep):
+            raise InventorError(f"won't {what} {path}: it is inside {root} (Autodesk's libraries, templates or install, "
+                                "or a folder listed in INVENTOR_FORGE_PROTECTED). Save a copy elsewhere with a path")
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        raise InventorError(f"won't {what} {path}: the file is read-only (checked in, or a library part)")
+
+
 @tool("documents")
 def save_document(s: Session, path: str = "") -> dict:
     """Save the active document; with a path, Save As (folders are created). Relative paths go
@@ -286,6 +313,7 @@ def save_document(s: Session, path: str = "") -> dict:
         ext = {"part": ".ipt", "assembly": ".iam", "drawing": ".idw"}.get(s.kind(d), "")
         if ext and not os.path.splitext(path)[1]:
             path += ext
+        _guard_write(path)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         _release_path(s, d, path)
         try:
@@ -302,6 +330,10 @@ def save_document(s: Session, path: str = "") -> dict:
         if not safe(lambda: d.FullFileName, ""):
             name = plain_name(safe(lambda: d.DisplayName, "Untitled").split(".")[0], "Untitled")
             return save_document(s, os.path.join(s.workdir, name))
+        _guard_write(safe(lambda: d.FullFileName, ""))
+        for ref in items(safe(lambda: d.AllReferencedDocuments) or []):     # Save also writes changed dependents
+            if safe(lambda ref=ref: ref.Dirty, False):
+                _guard_write(safe(lambda ref=ref: ref.FullFileName, ""), "save the changed part")
         d.Save()
     return {"saved": safe(lambda: d.FullFileName, path)}
 
@@ -444,6 +476,7 @@ def export_document(s: Session, path: str, format: str = "") -> dict:
         path = os.path.join(s.workdir, "exports", path)
     if not os.path.splitext(path)[1]:
         path += ext
+    _guard_write(path, "export to")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if os.path.exists(path):
         os.remove(path)

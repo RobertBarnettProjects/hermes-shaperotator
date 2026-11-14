@@ -57,28 +57,37 @@ def safe_name(name: str, default: str = "file", limit: int = 80) -> str:
 
 
 # --------------------------------------------------------------------------- which arguments are written
-# cad_native tools whose path arguments are only read
-NATIVE_READS = {
-    "open_document": {"path"}, "place_component": {"path"}, "read_stress_report": {"path"},
-    "read_pdf_text": {"path"}, "set_active_project": {"project"}, "create_drawing": {"model_path"},
-    "add_base_view": {"model_path", "path", "model"}, "make_part_sheet": {"model_path", "model"},
-    "make_assembly_sheet": {"model_path", "model"},
-    # these name an open document or a file they only read
-    "activate_document": {"name", "path"}, "close_document": {"name"}, "copy_parameters": {"source"},
-    "link_parameters": {"source"}, "derive_part": {"source", "path"}, "insert_derived": {"source", "path"},
-}
+# inventor-forge declares which of its tool arguments it writes or reads (forge/fileargs.py, loaded on its own so
+# FreeCAD-only installs don't need pywin32); for its tools nothing is guessed
+def _forge_fileargs():
+    import importlib.util
+    src = Path(__file__).resolve().parent.parent / "backends" / "inventor" / "forge" / "fileargs.py"
+    spec = importlib.util.spec_from_file_location("hermes_shaperotator_fileargs", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)          # type: ignore[union-attr]
+    return mod
+
+
+FA = _forge_fileargs()
+NATIVE_READS = {k: set(v) for k, v in FA.READS.items()}
+NATIVE_NAMES = dict(FA.NAMES)
+SAVES_IN_PLACE = {"run_study_cases"}
+
+
+def forge_declares() -> bool:
+    """Is the active backend inventor-forge, whose file arguments are declared (no guessing needed)?"""
+    try:
+        return STATE.family == "inventor"
+    except Exception:
+        return False
+
+
 # words that make an argument a file location when they end its name: csv_path, filePath, outputDir, dest, saveAs
 PATH_WORDS = {"path", "paths", "file", "files", "filename", "filenames", "folder", "dir", "directory", "output", "outputs",
               "outfile", "dest", "destination", "target", "location", "uri", "url", "saveas"}
 # arguments that hold free text, never a location
 TEXT_KEYS = {"notes", "note", "text", "texts", "title", "description", "label", "comment", "expression", "value", "fields",
              "message", "prompt", "content", "code", "query"}
-# forge arguments that become part of a file name (sanitised to a plain name before the call)
-NATIVE_NAMES = {"analyze_stress": ("name", "study_name"), "analyze_modes": ("name", "study_name"),
-                "study_report": ("name",), "create_part": ("name",), "create_assembly": ("name",),
-                "create_drawing": ("name",)}
-# forge tools that save the open document where it is (no path argument)
-SAVES_IN_PLACE = {"run_study_cases"}
 
 
 def _parts(key: str) -> list[str]:
@@ -158,6 +167,8 @@ def written_args(tool_name: str, args: Any) -> list[tuple[str, str]]:
     if tool_name == "cad_native":
         tool = str(args.get("tool", ""))
         targs = args.get("args") if isinstance(args.get("args"), dict) else {}
+        if forge_declares():                            # exactly what the forge says this tool writes
+            return [(k, targs[k]) for k in FA.WRITES.get(tool, ()) if isinstance(targs.get(k), str) and targs[k].strip()]
         reads = NATIVE_READS.get(tool, set())
         names = NATIVE_NAMES.get(tool, ())
         # arguments named like a location, and any other value that looks like one (servers name them freely:

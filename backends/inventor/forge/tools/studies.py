@@ -731,6 +731,16 @@ def _load_results(path: str) -> dict:
     return {"cases": {}}
 
 
+def _case_level(e: Exception) -> bool:
+    """A failure that belongs to one case (its solve or its values), not to Inventor or the session: the sweep can
+    record it and go on. Anything that looks like Inventor going away or being busy stops the sweep instead."""
+    if not isinstance(e, InventorError):
+        return False
+    msg = str(e).lower()
+    stop = ("rpc server", "not connected", "has closed", "no study", "busy", "still waiting", "no answer after")
+    return not any(k in msg for k in stop)
+
+
 def _store_results(path: str, data: dict) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -744,8 +754,9 @@ def run_study_cases(s: Session, template: str, cases: list[dict], results_path: 
     """Run a table of load cases from one template study, with no mouse or keyboard. Each case copies the template,
     writes its load values, solves, reads the peaks and saves the file. Finished cases are recorded, so after a crash
     the same call carries on where it stopped; in a private Inventor (connect(private=true)) a crashed Inventor is restarted
-    and the run continues by itself. Save the document first, and keep runs short: long Inventor sessions are the usual
-    cause of crashes.
+    and the run continues by itself. A case that fails on its own (a degenerate mesh, values Inventor didn't keep) is
+    recorded as failed with the reason and the sweep goes on; calling again retries only the failed and unrun cases.
+    Save the document first, and keep runs short: long Inventor sessions are the usual cause of crashes.
 
     template: an existing study with its faces, supports and loads
     cases: [{"name": "Pull 15deg", "values": ["0 N", "1000 N", "0 N", ...]}]; values follow copy_study's parameter
@@ -765,7 +776,7 @@ def run_study_cases(s: Session, template: str, cases: list[dict], results_path: 
         raise InventorError("every case needs its own non-empty name")
     if template not in _study_nodes(s):
         raise InventorError(f"no study {template!r}; this document has {sorted(_study_nodes(s))}")
-    ran = skipped = restarts = 0
+    ran = skipped = restarts = failed = 0
     doc_path = safe(lambda: s.doc().FullFileName, "")
     private = s.private                       # read now: the session drops the flag the moment its Inventor dies
     reasons: list[str] = []
@@ -783,7 +794,15 @@ def run_study_cases(s: Session, template: str, cases: list[dict], results_path: 
                 ran += 1
                 break
             except Exception as e:
-                if not (private and doc_path and pid not in U.pids_named("Inventor.exe") and restarts < 2):
+                inventor_died = bool(private and doc_path and pid not in U.pids_named("Inventor.exe"))
+                if not inventor_died and _case_level(e):
+                    # this case can't be solved (degenerate mesh, values not kept...): record why and run the rest
+                    data["cases"][name] = {"status": "failed", "error": str(e)[:600], "values": case.get("values"),
+                                           "template": template}
+                    _store_results(path, data)
+                    failed += 1
+                    break
+                if not (inventor_died and restarts < 2):
                     raise
                 restarts += 1                       # this session's own Inventor died: start another and carry on
                 reasons.append(f"{type(e).__name__}: {e}"[:200])
@@ -793,7 +812,8 @@ def run_study_cases(s: Session, template: str, cases: list[dict], results_path: 
                 s.set_current(s.app.Documents.Open(doc_path, True))
                 pid = _pid(s)
                 _enter_analysis(s)
-    return {"ran": ran, "already_done": skipped, "inventor_restarts": restarts, "restart_reasons": reasons, "results_path": path,
+    return {"ran": ran, "failed": failed, "already_done": skipped, "inventor_restarts": restarts, "restart_reasons": reasons,
+            "results_path": path,
             "cases": {n: data["cases"][n] for n in names if n in data["cases"]}}
 
 
