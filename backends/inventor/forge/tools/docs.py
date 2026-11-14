@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 
-from ..com import InventorError, K, items, late, plain_name, safe
+from ..com import MM, InventorError, K, items, late, plain_name, safe
 from ..registry import tool
 from ..session import Session
 
@@ -230,6 +230,95 @@ def open_document(s: Session, path: str) -> dict:
                             if safe(lambda x=x: bool(x.ReferenceMissing), False)], [])
     if missing:
         out["missing_references"] = missing[:20]
+    if os.path.splitext(path)[1].lower() in (".stp", ".step", ".igs", ".iges", ".sat", ".x_t", ".x_b", ".jt"):
+        rep = safe(lambda: _import_report(s, d))
+        if rep:
+            out["import_check"] = rep
+    return out
+
+
+def _bodies(cd) -> list:
+    """Every body of a part: its solids and the bodies of its work surfaces (where imported surfaces land)."""
+    out = list(items(safe(lambda: cd.SurfaceBodies) or []))
+    for ws in items(safe(lambda: cd.WorkSurfaces) or []):
+        out += list(items(safe(lambda ws=ws: ws.SurfaceBodies) or []))
+    return out
+
+
+def _import_report(s: Session, d, sliver_mm2: float = 0.05) -> dict | None:
+    """Solid and surface-only bodies, and the smallest faces (slivers that trouble meshing and fillets)."""
+    if s.kind(d) != "part":
+        return None
+    cd = d.ComponentDefinition
+    bodies = _bodies(cd)
+    solid = [b for b in bodies if safe(lambda b=b: b.IsSolid, False)]
+    faces = []
+    for bi, b in enumerate(bodies, 1):
+        for f in items(safe(lambda b=b: b.Faces) or []):
+            a = safe(lambda f=f: f.Evaluator.Area)
+            if a is not None:
+                faces.append((a * 100.0, bi))
+    faces.sort()
+    slivers = [f for f in faces if f[0] < sliver_mm2]
+    rep = {"bodies": len(bodies), "solid": len(solid), "surface_only": len(bodies) - len(solid),
+           "faces": len(faces), "smallest_faces_mm2": [round(a, 5) for a, _ in faces[:5]],
+           "slivers": len(slivers)}
+    if rep["surface_only"]:
+        rep["advice"] = "some bodies are open surfaces (no volume, no mass): repair_import(fix=true) knits them into a solid"
+    elif slivers:
+        rep["advice"] = f"{len(slivers)} faces under {sliver_mm2} mm2: they can break meshing, fillets and shells"
+    return rep
+
+
+@tool("features")
+def repair_import(s: Session, fix: bool = False, tolerance: float = 0.01) -> dict:
+    """Check an imported part (STEP, IGES...): how many bodies are solid and how many are open surfaces (no volume,
+    so no mass and no booleans), and the smallest faces (slivers). With fix, knit the surfaces into one body and
+    report whether it closed into a solid.
+
+    fix: knit the surface bodies together (Inventor's stitch)
+    tolerance: mm, the largest gap between surface edges to close when knitting
+    """
+    d = s.doc()
+    if s.kind(d) != "part":
+        raise InventorError("repair_import works on a part")
+    before = _import_report(s, d)
+    out = {"before": before}
+    cd = d.ComponentDefinition
+    open_bodies = [b for b in _bodies(cd) if not safe(lambda b=b: b.IsSolid, False)]
+    if open_bodies:
+        edges = [e for b in open_bodies for e in items(safe(lambda b=b: b.Edges) or [])
+                 if safe(lambda e=e: e.Faces.Count, 2) < 2]
+        out["open_edges"] = len(edges)
+        out["open_edges_at_mm"] = [[round(c * 10, 2) for c in (lambda p_: (p_.X, p_.Y, p_.Z))(e.StartVertex.Point)]
+                                   for e in edges[:8] if safe(lambda e=e: e.StartVertex)]
+    if fix and open_bodies and len(open_bodies) < 2:
+        out["advice"] = (f"one open body with {out.get('open_edges', 0)} open edges: there is nothing to knit it to. "
+                         "The import is missing faces: patch the openings (boundary patch), then knit, or re-export "
+                         "the file as a solid")
+        out["solid_now"] = False
+        return out
+    if fix and open_bodies:
+        tries = [open_bodies, list(items(safe(lambda: cd.WorkSurfaces) or []))]
+        knit, err = None, None
+        for objs in tries:
+            if len(objs) < 2:
+                continue
+            try:
+                knit = cd.Features.KnitFeatures.Add(s.collection(objs), float(tolerance) * MM, False)
+                break
+            except Exception as e:  # noqa: BLE001
+                err = e
+        if knit is None:
+            raise InventorError(f"Inventor couldn't knit the {len(open_bodies)} surface bodies"
+                                + (f" ({err})" if err else "") + "; try a larger tolerance")
+        d.Update()
+        out["knit"] = safe(lambda: knit.Name, "Knit")
+        out["after"] = _import_report(s, d)
+        out["solid_now"] = bool(out["after"] and out["after"]["surface_only"] == 0)
+        if not out["solid_now"]:
+            out["advice"] = ("the surfaces didn't close: raise tolerance a little (e.g. 0.05 mm), or the import has "
+                             "missing faces; patch or boundary-patch the openings, then knit again")
     return out
 
 

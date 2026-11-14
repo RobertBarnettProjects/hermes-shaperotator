@@ -165,6 +165,18 @@ class Session:
                 pass
         return False
 
+    def focus_note(self) -> str:
+        """When attached to the user's Inventor: a note if the session worked on a different document from the one
+        the user has in front (so neither side is surprised by what changed where). Empty otherwise."""
+        if self.private or self._app is None:
+            return ""
+        cur = self._working()
+        act = safe(lambda: self._app.ActiveDocument)
+        if cur is None or act is None or self.key(act) == self.key(cur):
+            return ""
+        return (f"worked on {safe(lambda: cur.DisplayName, '?')}; the document in front in Inventor is "
+                f"{safe(lambda: act.DisplayName, '?')}")
+
     def front(self):
         """The working document, made Inventor's active document: for commands, selections and the active view,
         which always act on whatever is active. In the user's Inventor this switches documents only when needed."""

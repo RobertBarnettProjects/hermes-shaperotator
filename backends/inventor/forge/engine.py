@@ -9,7 +9,7 @@ import traceback
 from typing import Any
 
 from .standards import StandardError
-from .com import Apartment, InventorError, com_error_text
+from .com import Apartment, InventorError, com_error_text, safe
 from .registry import TOOLS, load_all
 from .session import Session
 
@@ -134,7 +134,12 @@ class Forge:
                     raise InventorError(f"{name}: Inventor rejected the operation — {text}"
                                         + (f". Try: {h}" if h else "")) from e
                 raise
-            return _plain(out) if isinstance(out, dict) else {"result": _plain(out)}
+            res = _plain(out) if isinstance(out, dict) else {"result": _plain(out)}
+            if t.mutates:
+                note = safe(lambda: self.session.focus_note(), "")
+                if note:
+                    res["document_note"] = note
+            return res
 
         wait = call_budget(t.fn, args, timeout)
         if self.pending is not None and not self.pending["future"].done():

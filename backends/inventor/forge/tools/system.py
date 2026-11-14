@@ -28,6 +28,102 @@ def _log_snippet(s: Session, code: str, outcome: str) -> None:
         pass
 
 
+# --------------------------------------------------------------------------- Inventor API reference
+_API_INDEX: list | None = None
+_VT = {2: "short", 3: "long", 4: "float", 5: "double", 8: "string", 9: "object", 11: "bool", 12: "variant",
+       13: "unknown", 16: "byte", 17: "byte", 18: "ushort", 19: "ulong", 20: "int64", 22: "int", 24: "void", 25: "HRESULT",
+       26: "ptr", 27: "array", 29: "object"}
+
+
+def _type_name(ti, td) -> str:
+    """A readable name for a TYPEDESC from the type library."""
+    try:
+        import pythoncom
+        vt = td[0] if isinstance(td, tuple) else td
+        if isinstance(td, tuple) and vt == pythoncom.VT_PTR:
+            return _type_name(ti, td[1])
+        if isinstance(td, tuple) and vt == pythoncom.VT_USERDEFINED:
+            return ti.GetRefTypeInfo(td[1]).GetDocumentation(-1)[0]
+        if isinstance(td, tuple) and vt == pythoncom.VT_SAFEARRAY:
+            return _type_name(ti, td[1]) + "[]"
+        return _VT.get(vt, str(vt))
+    except Exception:
+        return "?"
+
+
+def _api_index() -> list:
+    """(kind, owner, name, signature, doc) for every interface member and enum in Inventor's type library."""
+    global _API_INDEX
+    if _API_INDEX is not None:
+        return _API_INDEX
+    import pythoncom
+
+    from ..com import INVENTOR_TYPELIB
+    tlb = pythoncom.LoadRegTypeLib(INVENTOR_TYPELIB, 1, 0, 0)
+    out = []
+    for i in range(tlb.GetTypeInfoCount()):
+        ti = tlb.GetTypeInfo(i)
+        attr = ti.GetTypeAttr()
+        owner = tlb.GetDocumentation(i)[0]
+        if attr.typekind == pythoncom.TKIND_ENUM:
+            names = [ti.GetNames(ti.GetVarDesc(j).memid)[0] for j in range(attr.cVars)]
+            out.append(("enum", owner, owner, ", ".join(names[:40]) + (" ..." if len(names) > 40 else ""),
+                        tlb.GetDocumentation(i)[1] or ""))
+            continue
+        if attr.typekind not in (pythoncom.TKIND_DISPATCH, pythoncom.TKIND_INTERFACE):
+            continue
+        seen = set()
+        for j in range(attr.cFuncs):
+            fd = ti.GetFuncDesc(j)
+            names = ti.GetNames(fd.memid)
+            name = names[0]
+            if name.startswith("_") or name in ("QueryInterface", "AddRef", "Release", "GetTypeInfoCount",
+                                                "GetTypeInfo", "GetIDsOfNames", "Invoke"):
+                continue
+            kind = {pythoncom.INVOKE_PROPERTYGET: "property", pythoncom.INVOKE_PROPERTYPUT: "property",
+                    pythoncom.INVOKE_PROPERTYPUTREF: "property"}.get(fd.invkind, "method")
+            if (name, kind) in seen:
+                continue
+            seen.add((name, kind))
+            args = []
+            for k, a in enumerate(fd.args):
+                pname = names[k + 1] if k + 1 < len(names) else f"arg{k}"
+                flags = a[1]
+                tag = "out " if flags & pythoncom.PARAMFLAG_FOUT and not flags & pythoncom.PARAMFLAG_FIN else ""
+                opt = "?" if flags & pythoncom.PARAMFLAG_FOPT else ""
+                args.append(f"{tag}{pname}{opt}: {_type_name(ti, a[0])}")
+            rt = fd.rettype
+            ret = _type_name(ti, rt[0] if isinstance(rt, tuple) and len(rt) == 3 else rt)
+            sig = f"{name}({', '.join(args)}) -> {ret}" if kind == "method" else f"{name}: {ret}"
+            doc = ti.GetDocumentation(fd.memid)[1] or ""
+            out.append((kind, owner, name, sig, doc))
+    _API_INDEX = out
+    return out
+
+
+@tool("system", mutates=False, com=False)
+def api_lookup(s: Session, query: str, object: str = "", limit: int = 25) -> dict:
+    """Look up Inventor's API in its own type library (offline, version-exact): objects, their methods and
+    properties with argument names and types ([out] marks arguments to pass to typed_call), and enums. For writing
+    execute_python code. Distances in the API are cm, angles radians.
+
+    query: word to find in member names (e.g. "AddByDistanceExtent", "Fillet", "Mass")
+    object: only members of this object (e.g. "ExtrudeFeatures", "PartComponentDefinition")
+    limit: how many matches to return
+    """
+    q, obj = query.lower(), object.lower()
+    rows = []
+    for kind, owner, name, sig, doc in _api_index():
+        if obj and owner.lower() != obj:
+            continue
+        if q and q not in name.lower() and q not in owner.lower():
+            continue
+        rows.append({"object": owner, "kind": kind, "signature": sig, **({"doc": doc[:200]} if doc else {})})
+    exact = [r_ for r_ in rows if r_["signature"].lower().startswith(q)]
+    rows = exact + [r_ for r_ in rows if r_ not in exact]
+    return {"matches": rows[:int(limit)], "total": len(rows)}
+
+
 # --------------------------------------------------------------------------- calls held up by a dialog
 @tool("system", mutates=False, com=False)
 def pending_call(s: Session, wait_seconds: float = 0.0) -> dict:
