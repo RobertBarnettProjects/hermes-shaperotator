@@ -268,3 +268,70 @@ def pattern_component(s: Session, occurrences: list[str], axis: str = "Z", count
     else:
         pat = cd.OccurrencePatterns.AddCircularPattern(parents, ax, True, math.radians(angle), int(count))
     return {"pattern": pat.Name, "occurrences": cd.Occurrences.Count}
+
+
+@tool("assembly")
+def sweep_clearance(s: Session, constraint: str, start: float, stop: float, steps: int = 12,
+                    moving: str = "", against: str = "") -> dict:
+    """Drive an angle or offset constraint through a range and, at every step, check for clashes and the smallest
+    gap between the moving component and the rest: hinges, levers, steering, sliders. The constraint is put back
+    to where it was afterwards. Gives the first value where parts collide and the tightest clearance.
+
+    constraint: the constraint's name (inspect_assembly lists them); an angle constraint is driven in degrees,
+      any other (mate/flush/insert offset) in mm
+    start: first value
+    stop: last value
+    steps: number of intervals (steps + 1 positions are checked)
+    moving: the component that moves (default: the constraint's second component)
+    against: only measure the gap to this component (default: every other component)
+    """
+    asm = s.assembly()
+    cd = asm.ComponentDefinition
+    c = next((x for x in items(cd.Constraints) if x.Name.lower() == constraint.lower()), None)
+    if c is None:
+        raise InventorError(f"no constraint {constraint!r}; constraints: {[x.Name for x in items(cd.Constraints)]}")
+    is_angle = safe(lambda: c.Angle, None) is not None
+    param = c.Angle if is_angle else safe(lambda: c.Offset)
+    if param is None:
+        raise InventorError(f"{constraint} has no angle or offset to drive")
+    unit = "deg" if is_angle else "mm"
+    mover = _occ(s, moving) if moving else safe(lambda: c.OccurrenceTwo) or safe(lambda: c.OccurrenceOne)
+    if mover is None:
+        raise InventorError("couldn't tell which component moves; give moving")
+    others = [_occ(s, against)] if against else [o for o in items(cd.Occurrences) if o.Name != mover.Name]
+    original = param.Expression
+    n = max(1, int(steps))
+    rows, first_clash, tightest = [], None, None
+    try:
+        for i in range(n + 1):
+            value = float(start) + (float(stop) - float(start)) * i / n
+            param.Expression = f"{value:.6g} {unit}"
+            asm.Update()
+            clashes = []
+            res = cd.AnalyzeInterference(s.collection([mover]), s.collection(others))
+            for it in items(res):
+                other = it.OccurrenceTwo if it.OccurrenceOne.Name == mover.Name else it.OccurrenceOne
+                clashes.append({"with": other.Name, "volume_mm3": r(it.Volume * CM3_TO_MM3, 3)})
+            gap, gap_to = None, ""
+            if not clashes:
+                for o in others:
+                    d = safe(lambda o=o: s.app.MeasureTools.GetMinimumDistance(mover, o))
+                    d = d[0] if isinstance(d, tuple) else d
+                    if d is not None and (gap is None or d * 10 < gap):
+                        gap, gap_to = d * 10, o.Name
+            row = {"value": r(value, 4), "clashes": clashes, "min_gap_mm": r(gap, 3) if gap is not None else 0.0,
+                   "nearest": gap_to or (clashes[0]["with"] if clashes else "")}
+            rows.append(row)
+            if clashes and first_clash is None:
+                first_clash = row
+            if not clashes and gap is not None and (tightest is None or gap < tightest["min_gap_mm"]):
+                tightest = row
+    finally:
+        param.Expression = original
+        safe(lambda: asm.Update())
+    return {"constraint": c.Name, "moving": mover.Name, "unit": unit, "steps": rows,
+            "first_clash_at": first_clash["value"] if first_clash else None,
+            "first_clash_with": [x["with"] for x in first_clash["clashes"]] if first_clash else [],
+            "tightest_clearance": {"at": tightest["value"], "gap_mm": tightest["min_gap_mm"], "to": tightest["nearest"]}
+            if tightest else None,
+            "restored": original}
