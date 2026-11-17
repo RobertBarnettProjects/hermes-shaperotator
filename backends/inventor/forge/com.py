@@ -39,6 +39,8 @@ class Apartment:
         import pythoncom
         pythoncom.CoInitialize()
         self._ident = threading.get_ident()
+        from .health import register_message_filter
+        self.message_filter = register_message_filter()      # "busy" refusals are sent again instead of failing
         try:
             while True:
                 fn, fut = self._q.get()

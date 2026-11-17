@@ -6,7 +6,7 @@ import math
 
 from ..com import MM, InventorError, K, items, r, safe
 from ..registry import tool
-from ..session import Session
+from ..session import Session, set_name
 from .inspect import face_normal, find_planar_face
 
 OPS = {"join": "kJoinOperation", "cut": "kCutOperation", "intersect": "kIntersectOperation",
@@ -86,7 +86,7 @@ def _profile(s: Session, sketch_index: int = 0):
 
 @tool("features")
 def extrude(s: Session, distance: float = 10.0, operation: str = "join", direction: str = "auto",
-            through_all: bool = False, taper: float = 0.0, sketch_index: int = 0) -> dict:
+            through_all: bool = False, taper: float = 0.0, sketch_index: int = 0, body: str = "") -> dict:
     """Extrude the active sketch's closed profile(s) — all closed regions, inner loops become holes.
 
     distance: mm (ignored with through_all)
@@ -96,10 +96,13 @@ def extrude(s: Session, distance: float = 10.0, operation: str = "join", directi
     through_all: cut/extrude through everything
     taper: draft angle in degrees (negative tapers inward)
     sketch_index: 1-based sketch, 0 = the active sketch
+    body: in a multi-body part, the body (name or index, or a list) a cut/join/intersect acts on. Without it
+      Inventor chooses, and a cut can land on the wrong body; a cut that removes nothing from it is refused
     """
     sk, prof = _profile(s, sketch_index)
     ef = s.cdef().Features.ExtrudeFeatures
     opv = _op(operation)
+    targets = s.bodies_named(body) if body and operation != "new_body" else []
 
     def make(dirname: str):
         d = ef.CreateExtrudeDefinition(prof, opv)
@@ -111,19 +114,45 @@ def extrude(s: Session, distance: float = 10.0, operation: str = "join", directi
             d.SetDistanceExtent(distance * MM, _dir(dirname))
         if taper:
             d.TaperAngle = f"{taper} deg"
+        if targets:
+            d.AffectedBodies = s.collection(targets)
         return ef.Add(d)
 
-    if direction == "auto":
-        if operation == "cut":
-            feat, used, before = _try_directions(s, "Extrude", make, "negative", "positive")
+    try:
+        if direction == "auto":
+            if operation == "cut":
+                feat, used, before = _try_directions(s, "Extrude", make, "negative", "positive")
+            else:
+                before = s.snapshot()
+                feat, used = make("positive"), "positive"
         else:
             before = s.snapshot()
-            feat, used = make("positive"), "positive"
-    else:
-        before = s.snapshot()
-        feat, used = make(direction), direction
+            feat, used = make(direction), direction
+    except Exception as e:  # noqa: BLE001
+        if not targets or type(e).__name__ != "com_error":
+            raise
+        names = [safe(lambda b=b: b.Name, "") for b in targets]
+        raise InventorError(f"Inventor refused the {operation} on {names}: the profile's extrusion doesn't reach that "
+                            "body (or would leave it unchanged). Check the sketch lies over it and the extent and "
+                            "direction cross it") from e
     out = s.delta(feat.Name, before)
     out.update({"feature": feat.Name, "direction": used, "sketch": sk.Name})
+    return _check_targets(s, out, feat, targets, operation)
+
+
+def _check_targets(s: Session, out: dict, feat, targets: list, operation: str) -> dict:
+    """With named target bodies, a cut or join that left every one of them unchanged is undone and refused: it
+    'succeeded' on nothing."""
+    if not targets or operation not in ("cut", "join", "intersect"):
+        return out
+    names = [safe(lambda b=b: b.Name, "") for b in targets]
+    changed = out.get("bodies_changed") or {}
+    if not any(n in changed for n in names) and abs(out.get("volume_change_mm3", 0)) < 1e-6:
+        fname = safe(lambda: feat.Name, "the feature")
+        safe(lambda: feat.Delete(True, False, False))
+        raise InventorError(f"{fname} changed nothing in {names} (zero volume change), so it was removed again; "
+                            "check the sketch lies over that body and the direction/extent reaches it")
+    out["bodies"] = names
     return out
 
 
@@ -156,6 +185,32 @@ def revolve(s: Session, axis: str = "Y", angle: float = 360.0, operation: str = 
     return out
 
 
+def _off_face(s: Session, face, centres: list, body=None) -> list:
+    """Centres (2-D on the face's plane, or 3-D) that don't land on the face: just under the face at that spot there
+    must be material and just above it air (the same test that picks the start face)."""
+    from .inspect import face_normal as _fn
+    from .inspect import point_inside
+    n = _fn(face)
+    p0 = face.PointOnFace
+    ax = max(range(3), key=lambda i: abs(n[i]))
+    rest = [i for i in range(3) if i != ax]
+    solid = safe(lambda: face.Parent) or s.body(body)
+    level = [p0.X, p0.Y, p0.Z]
+    bad = []
+    for c in centres:
+        q = [0.0, 0.0, 0.0]
+        if len(c) >= 3:
+            q = [float(v) * MM for v in c[:3]]
+        else:
+            q[rest[0]], q[rest[1]] = float(c[0]) * MM, float(c[1]) * MM
+            q[ax] = level[ax]
+        below = [q[i] - n[i] * 0.002 for i in range(3)]
+        above = [q[i] + n[i] * 0.002 for i in range(3)]
+        if point_inside(solid, below) is False or point_inside(solid, above) is True:
+            bad.append(c)
+    return bad
+
+
 def _hole_feature(s: Session, placement, dia_or_tap, depth, dirname, cbore, csink):
     hf = s.cdef().Features.HoleFeatures
     d = _dir(dirname)
@@ -177,7 +232,8 @@ def _hole_feature(s: Session, placement, dia_or_tap, depth, dirname, cbore, csin
 def hole(s: Session, x: float = 0.0, y: float = 0.0, diameter: float = 10.0, depth: float = 0.0,
          points: list[list[float]] | None = None, face_index: int = 0, axis: str = "Z",
          tap: str = "", tap_class: str = "6H", cbore_diameter: float = 0.0, cbore_depth: float = 0.0,
-         csink_diameter: float = 0.0, csink_angle: float = 90.0, use_sketch_points: bool = False) -> dict:
+         csink_diameter: float = 0.0, csink_angle: float = 90.0, use_sketch_points: bool = False,
+         body: str = "") -> dict:
     """Drilled, tapped, counterbored or countersunk hole(s), placed by model coordinates.
 
     x: mm, model X of the hole centre (y likewise); or give several centres in points
@@ -189,8 +245,12 @@ def hole(s: Session, x: float = 0.0, y: float = 0.0, diameter: float = 10.0, dep
     cbore_diameter: counterbore Ø and cbore_depth (mm)
     csink_diameter: countersink Ø and csink_angle (degrees)
     use_sketch_points: drill every hole-centre point of the active sketch instead (draw_point)
+    body: in a multi-body part, the body to drill (name or index); its faces are searched for the start face and
+      the hole cuts only it. Each centre is checked to lie on the start face
     """
     cd = s.cdef()
+    targets = s.bodies_named(body) if body else []
+    tb = body or None
     if use_sketch_points:
         sk = s.sketch()
         pts = [p for p in items(sk.SketchPoints) if p.HoleCenter]
@@ -198,14 +258,20 @@ def hole(s: Session, x: float = 0.0, y: float = 0.0, diameter: float = 10.0, dep
             raise InventorError("the active sketch has no hole-centre points")
     else:
         first = (points or [[x, y]])[0]
-        face = s.face(face_index) if face_index else (find_planar_face(s, axis, at=first[:2]) or
-                                                      find_planar_face(s, axis))
+        face = s.face(face_index, tb) if face_index else (find_planar_face(s, axis, at=first[:2], body=tb) or
+                                                          find_planar_face(s, axis, body=tb))
         if face is None:
             raise InventorError(f"no planar face facing +{axis}; pass face_index")
         sk = cd.Sketches.Add(face, False)
         n = face_normal(face)
         p0 = face.PointOnFace
         centres = points if points else [[x, y]]
+        off = _off_face(s, face, centres, tb)
+        if off:
+            safe(lambda: sk.Delete())
+            raise InventorError(f"hole centre(s) {off} don't lie on the start face (on "
+                                f"{safe(lambda: face.Parent.Name, 'the body')}, facing {[round(v, 3) for v in n]}); "
+                                "give face_index for the face they are on, or drill them in separate calls")
         pts = []
         for c in centres:
             if len(c) >= 3:
@@ -232,7 +298,12 @@ def hole(s: Session, x: float = 0.0, y: float = 0.0, diameter: float = 10.0, dep
     feat, used, before = _try_directions(
         s, "Hole", lambda dn: _hole_feature(s, placement, dia_or_tap, depth, dn, cbore, csink),
         "positive", "negative")
+    if targets:
+        safe(lambda: feat.SetAffectedBodies(s.collection(targets)))
     out = s.delta(feat.Name, before)
+    out = _check_targets(s, out, feat, targets, "cut")
+    if not use_sketch_points:
+        out["start_face_normal"] = [round(v, 4) for v in n]
     out.update({"feature": feat.Name, "holes": len(pts), "kind": "tapped " + tap if tap else
                 ("counterbored" if cbore else "countersunk" if csink else "drilled"),
                 "through": not depth})
@@ -261,10 +332,13 @@ def hole_linear(s: Session, face_index: int, edge_one: int, distance_one: float,
 
 
 @tool("features")
-def fillet(s: Session, radius: float, edges: list[int]) -> dict:
-    """Constant-radius fillet on edges (1-based indices from list_edges / find_edge)."""
+def fillet(s: Session, radius: float, edges: list[int], body: str = "") -> dict:
+    """Constant-radius fillet on edges (1-based indices from list_edges / find_edge).
+
+    body: the body the edge indices belong to (name or index; default the first)
+    """
     before = s.snapshot()
-    ec = s.edge_collection([s.edge(i) for i in edges])
+    ec = s.edge_collection([s.edge(i, body or None) for i in edges])
     feat = s.cdef().Features.FilletFeatures.AddSimple(ec, radius * MM)
     out = s.delta(feat.Name, before)
     out["feature"] = feat.Name
@@ -273,16 +347,20 @@ def fillet(s: Session, radius: float, edges: list[int]) -> dict:
 
 @tool("features")
 def chamfer(s: Session, distance: float, edges: list[int], distance_two: float = 0.0, angle: float = 0.0,
-            face_index: int = 0) -> dict:
+            face_index: int = 0, body: str = "") -> dict:
     """Chamfer edges: equal distance, two distances, or distance + angle (needs face_index for the
-    reference face of the last two forms)."""
+    reference face of the last two forms).
+
+    body: the body the edge and face indices belong to (name or index; default the first)
+    """
     before = s.snapshot()
     cf = s.cdef().Features.ChamferFeatures
-    ec = s.edge_collection([s.edge(i) for i in edges])
+    b = body or None
+    ec = s.edge_collection([s.edge(i, b) for i in edges])
     if distance_two:
-        feat = cf.AddUsingTwoDistances(ec, s.face(face_index), distance * MM, distance_two * MM)
+        feat = cf.AddUsingTwoDistances(ec, s.face(face_index, b), distance * MM, distance_two * MM)
     elif angle:
-        feat = cf.AddUsingDistanceAndAngle(ec, s.face(face_index), distance * MM, math.radians(angle))
+        feat = cf.AddUsingDistanceAndAngle(ec, s.face(face_index, b), distance * MM, math.radians(angle))
     else:
         feat = cf.AddUsingDistance(ec, distance * MM)
     out = s.delta(feat.Name, before)
@@ -422,7 +500,7 @@ def work_plane(s: Session, base: str = "XY", offset: float = 0.0, angle: float =
     else:
         wp = wps.AddByPlaneAndOffset(s.work_plane(base), offset * MM)
     if name:
-        wp.Name = name
+        set_name(wp, name, "work plane")
     return {"work_plane": wp.Name}
 
 
@@ -437,8 +515,43 @@ def work_axis(s: Session, face_index: int = 0, edge_index: int = 0, name: str = 
     else:
         raise InventorError("give face_index (cylindrical face) or edge_index")
     if name:
-        wa.Name = name
+        set_name(wa, name, "work axis")
     return {"work_axis": wa.Name}
+
+
+@tool("features")
+def rename(s: Session, kind: str, target: str, new_name: str) -> dict:
+    """Rename a feature, body, sketch, work plane, work axis, user parameter or assembly component, and read the name
+    back: Inventor silently ignores names that are already used (a body named like a feature) or not allowed.
+
+    kind: feature | body | sketch | work_plane | work_axis | parameter | occurrence
+    target: its current name, or 1-based index (features, bodies, sketches)
+    new_name: the name to give it
+    """
+    k = kind.strip().lower()
+    if k == "occurrence":
+        from .assembly import _occ
+        obj = _occ(s, target)
+    elif k == "feature":
+        obj = _feature(s, target)
+    elif k in ("body", "sketch"):
+        coll = list(items(s.cdef().SurfaceBodies if k == "body" else s.cdef().Sketches))
+        obj = coll[int(target) - 1] if str(target).isdigit() and 1 <= int(target) <= len(coll) else \
+            next((b for b in coll if safe(lambda b=b: b.Name, "").lower() == str(target).lower()), None)
+        if obj is None:
+            raise InventorError(f"no {k} {target!r}; there are {[safe(lambda b=b: b.Name, '?') for b in coll]}")
+    elif k == "work_plane":
+        obj = s.work_plane(target)
+    elif k == "work_axis":
+        obj = s.work_axis(target)
+    elif k == "parameter":
+        obj = safe(lambda: s.doc().ComponentDefinition.Parameters.Item(target))
+        if obj is None:
+            raise InventorError(f"no parameter {target!r} (see get_parameters)")
+    else:
+        raise InventorError("kind must be feature, body, sketch, work_plane, work_axis, parameter or occurrence")
+    old = safe(lambda: obj.Name, str(target))
+    return {"renamed": old, "to": set_name(obj, new_name, k.replace("_", " "))}
 
 
 @tool("features", mutates=False)
@@ -757,6 +870,38 @@ def _end_kind(p, i, ms) -> str:
     return "free"
 
 
+def _hosts_at(p, i, ms) -> list[int]:
+    """Members that run through point p (p lies inside them, away from their ends), other than member i: the tubes
+    an end at p is welded onto."""
+    out = []
+    for j, m in enumerate(ms):
+        if j == i or math.dist(p, m["a"]) < 0.01 or math.dist(p, m["b"]) < 0.01:
+            continue
+        a, b = m["a"], m["b"]
+        ab = [b[k] - a[k] for k in range(3)]
+        L2 = sum(v * v for v in ab)
+        t = sum((p[k] - a[k]) * ab[k] for k in range(3)) / L2
+        if 0 < t < 1 and math.dist(p, [a[k] + t * ab[k] for k in range(3)]) < m["od"] / 2 + 0.01:
+            out.append(j)
+    return out
+
+
+def _reach_axis(p, out, host) -> list:
+    """Where an end at p, running on along unit direction `out`, comes closest to the host member's axis: the point a
+    tee end is extended to so its tube is fully coped into the host. Returns p when that is behind the end or far off."""
+    a, b = host["a"], host["b"]
+    d = _unit([b[k] - a[k] for k in range(3)])
+    w = [p[k] - a[k] for k in range(3)]
+    bb = sum(out[k] * d[k] for k in range(3))
+    den = 1 - bb * bb
+    if den < 1e-9:                                    # running along the host: nothing to reach
+        return list(p)
+    s_ = (bb * sum(w[k] * d[k] for k in range(3)) - sum(w[k] * out[k] for k in range(3))) / den
+    if s_ <= 0 or s_ > host["od"]:
+        return list(p)
+    return [p[k] + out[k] * s_ for k in range(3)]
+
+
 @tool("features")
 def tube_frame(s: Session, members: list, od: float = 33.7, wall: float = 2.6, name: str = "Tube frame") -> dict:
     """A welded round-tube (CHS) frame in 3D, in one step: each member is a straight tube on a centre line
@@ -864,8 +1009,9 @@ def _perp(n):
 def _tube_frame_brep(s: Session, ms: list, name: str) -> dict:
     """Exact welded CHS frame from transient B-rep: every member is a cylinder; two members meeting at a corner are
     both mitred on the bisector plane; where three or more member ends meet, the tubes end at a welded node; a member
-    ending on another's side is coped into it (ends at its axis, inside the host). Outer solids are unioned, then the
-    bores (mitred the same way) are subtracted, so joints are clean with nothing crossing over."""
+    ending on another's side is coped into it (runs on to the host's axis, inside the host). Outer solids are unioned,
+    then the bores (mitred the same way) are subtracted. A bore stops at the outside of any tube its member is welded
+    onto, so the host's wall stays whole: joints are clean, with nothing crossing over and no holes."""
     tb, tg = s.app.TransientBRep, s.tg
     U, D, I = K.kBooleanTypeUnion, K.kBooleanTypeDifference, K.kBooleanTypeIntersect
     L = 1e4                                            # cm: half-space block size
@@ -891,15 +1037,42 @@ def _tube_frame_brep(s: Session, ms: list, name: str) -> dict:
         ends.setdefault(key(m["b"]), []).append((i, "b"))
     plans = []                                          # per member: [start, end, trims]
     nodes = []
+    hosts = []                                          # per member: tubes its ends are welded onto
     for i, m in enumerate(ms):
         a, b = list(m["a"]), list(m["b"])
         u = _unit([b[k] - a[k] for k in range(3)])
-        trims, kinds = [], []
+        trims, kinds, mine, caps = [], [], set(), []
         for side, P, out in (("a", a, [-c for c in u]), ("b", b, u)):
             others = [(j, sd) for j, sd in ends[key(P)] if j != i]
             kind = _end_kind(P, i, ms)
-            if kind == "corner" and len(others) == 1:
-                j, sd = others[0]
+            through = _hosts_at(P, i, ms)
+            mine.update(through)
+            if kind == "tee" and through:               # run on into the host so the tube is coped all round
+                P2 = _reach_axis(P, out, ms[through[0]])
+                if side == "a":
+                    a = P2
+                else:
+                    b = P2
+            pair = others[0] if kind == "corner" and len(others) == 1 else None
+            if pair and min(m["od"], ms[pair[0]]["od"]) < 0.9 * max(m["od"], ms[pair[0]]["od"]):
+                # unequal tubes don't mitre cleanly: the larger runs on past the joint and is capped, the smaller is
+                # coped into its side
+                j = pair[0]
+                if m["od"] > ms[j]["od"]:
+                    run = ms[j]["od"] / 2
+                    P2 = [P[k] + out[k] * run for k in range(3)]
+                    if side == "a":
+                        a = P2
+                    else:
+                        b = P2
+                    caps.append(([P2[k] - out[k] * max(m["wall"], 2.0) for k in range(3)], [-c for c in out]))
+                    kinds.append("run-on, capped")
+                else:
+                    mine.add(j)
+                    kinds.append("tee")
+                continue
+            if pair:
+                j, sd = pair
                 mj = ms[j]
                 q = mj["b"] if sd == "a" else mj["a"]
                 d_me = _unit([-c for c in out])         # from the node along me
@@ -921,12 +1094,13 @@ def _tube_frame_brep(s: Session, ms: list, name: str) -> dict:
             else:
                 kinds.append(kind)
         m["ends"] = kinds
-        plans.append((a, b, trims))
+        plans.append((a, b, trims, caps))
+        hosts.append(sorted(mine))
 
-    def member(i, radius):
-        a, b, trims = plans[i]
+    def member(i, radius, bore=False):
+        a, b, trims, caps = plans[i]
         body = tb.CreateSolidCylinderCone(pt(a), pt(b), radius * MM, radius * MM, radius * MM)
-        for P, n in trims:
+        for P, n in trims + (caps if bore else []):    # a capped end keeps a wall-thick plate over its bore
             tb.DoBoolean(body, half_space(P, n), I)
         return body
 
@@ -941,7 +1115,10 @@ def _tube_frame_brep(s: Session, ms: list, name: str) -> dict:
         tb.DoBoolean(total, tb.CreateSolidSphere(pt(P), rad * MM), U)
     for i, m in enumerate(ms):
         if m["wall"] > 0:
-            tb.DoBoolean(total, member(i, m["od"] / 2 - m["wall"]), D)
+            bore = member(i, m["od"] / 2 - m["wall"], bore=True)
+            for j in hosts[i]:                          # the bore stops at the host's outside: its wall stays whole
+                tb.DoBoolean(bore, member(j, ms[j]["od"] / 2), D)
+            tb.DoBoolean(total, bore, D)
 
     before = s.snapshot()
     cd = s.cdef()

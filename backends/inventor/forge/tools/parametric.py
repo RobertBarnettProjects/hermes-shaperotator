@@ -6,7 +6,7 @@ import os
 
 from ..com import MM, InventorError, K, items, r, safe
 from ..registry import tool
-from ..session import Session
+from ..session import Session, set_name
 from .assembly import _occ
 
 NAME_SET, NAME_ATTR = "iLogicEntityNameSet", "iLogicEntityName"      # the names Inventor's own Assign Name uses
@@ -137,7 +137,7 @@ def parametric_extrusion(s: Session, plane: str, vertices: list[list], width: st
     ed.SetDistanceExtent(1.0, K.kSymmetricExtentDirection if symmetric else K.kPositiveExtentDirection)
     feat = ef.Add(ed)
     if name:
-        feat.Name = name
+        set_name(feat, name, "feature")
     feat.Definition.Extent.Distance.Expression = str(width)
     d.Update()
     s.set_sketch(sk)
@@ -167,17 +167,60 @@ def list_model_states(s: Session) -> dict:
     return {"states": _state_rows(_states(s))}
 
 
-@tool("parameters")
-def add_model_state(s: Session, name: str, activate: bool = True) -> dict:
-    """Add a model state. While it is active, suppressing features or changing parameters only affects that state.
+def _suppressible(s: Session, name: str):
+    """A feature of the active part, or an occurrence of the active assembly, by name."""
+    d = s.doc()
+    if s.kind(d) == "assembly":
+        return _occ(s, name)
+    from .features import _feature
+    return _feature(s, name)
 
-    activate: switch to the new state
+
+def _set_suppressed(s: Session, obj, on: bool) -> bool:
+    """Suppress or unsuppress a feature or an occurrence; returns the state read back."""
+    if s.kind() == "assembly":
+        if on and not safe(lambda: obj.Suppressed, False):
+            obj.Suppress()
+        elif not on and safe(lambda: obj.Suppressed, False):
+            obj.Unsuppress()
+    else:
+        obj.Suppressed = bool(on)
+    return bool(safe(lambda: obj.Suppressed, on))
+
+
+@tool("parameters")
+def add_model_state(s: Session, name: str, activate: bool = True, suppress: list[str] | None = None,
+                    unsuppress: list[str] | None = None) -> dict:
+    """Add a model state. Inventor copies the active state into it, suppression included, so say explicitly what the
+    new state suppresses: list every feature (part) or component (assembly) that must be off, and anything copied in
+    suppressed that must be on. While a state is active, suppressing features or changing parameters only affects it.
+
+    activate: leave the new state active (otherwise the previously active state is restored)
+    suppress: feature or occurrence names to suppress in the new state
+    unsuppress: names to make sure are not suppressed in the new state
     """
     st = _states(s)
+    prev = safe(lambda: st.ActiveModelState.Name, "")
+    targets = [(n, True) for n in suppress or []] + [(n, False) for n in unsuppress or []]
+    objs = [(n, _suppressible(s, n), on) for n, on in targets]          # resolve names before changing anything
     m = st.Add(name)
-    if activate:
-        m.Activate()
-    return {"states": _state_rows(st)}
+    m.Activate()
+    applied = {}
+    for n, obj, on in objs:
+        obj = _suppressible(s, n)                                       # the object as seen in the new state
+        applied[n] = _set_suppressed(s, obj, on)
+    s.doc().Update()
+    wrong = [n for n, on in targets if applied.get(n) != on]
+    if not activate and prev:
+        back = next((x for x in items(st) if x.Name == prev), None)
+        if back is not None:
+            back.Activate()
+            s.doc().Update()
+    out = {"states": _state_rows(st), "copied_from": prev, "suppressed_in_new_state": sorted(
+        n for n, v in applied.items() if v)}
+    if wrong:
+        out["warning"] = f"Inventor did not take the suppression of {wrong}; check them in that state"
+    return out
 
 
 @tool("parameters")
@@ -262,13 +305,51 @@ def _coplanar(a: tuple, b: tuple) -> bool:
     return abs(sum((q[i] - p[i]) * n[i] for i in range(3))) < 1e-5
 
 
+def _split_targets(s: Session, planes: list) -> list:
+    """The current faces lying in the planes of the faces asked for (earlier splits replace faces with pieces)."""
+    return [f for f in s.faces() if (lambda q: q is not None and any(_coplanar(q, p) for p in planes))(_plane_of(f))]
+
+
+def _split_with(s: Session, sf, tool_obj, faces, planes):
+    if faces:
+        return sf.SplitFaces(tool_obj, False, s.face_collection(_split_targets(s, planes)))
+    return sf.SplitFaces(tool_obj, True, s.body())
+
+
+def _chains(cd, curves) -> list:
+    """One representative curve per connected chain of sketch curves."""
+    seen, reps = set(), []
+    for c in curves:
+        key = safe(lambda c=c: c.TransientKey)
+        if key in seen:
+            continue
+        path = safe(lambda c=c: cd.Features.CreatePath(c))
+        members = [safe(lambda e=e: e.SketchEntity.TransientKey) for e in items(path)] if path is not None else []
+        seen.update(k for k in members if k is not None)
+        seen.add(key)
+        reps.append(c)
+    return reps
+
+
+def _extent_cm(cd) -> float:
+    rb = safe(lambda: cd.RangeBox)
+    if rb is None:
+        return 100.0
+    return 2.0 * max(1.0, ((rb.MaxPoint.X - rb.MinPoint.X) ** 2 + (rb.MaxPoint.Y - rb.MinPoint.Y) ** 2 +
+                           (rb.MaxPoint.Z - rb.MinPoint.Z) ** 2) ** 0.5)
+
+
 @tool("features")
-def split_faces(s: Session, sketch: int = 0, faces: list[int] | None = None) -> dict:
+def split_faces(s: Session, sketch: int = 0, faces: list[int] | None = None, tool: str = "auto") -> dict:
     """Split faces along sketch lines, without changing the solid: for example to load only a patch of a face in an analysis.
-    The sketch doesn't have to be on the face.
+    The sketch doesn't have to be on the face. Inventor refuses a sketch itself as the splitting tool, so the lines are
+    turned into one of: paths (one split per line), a hidden work surface extruded from the sketch through the part
+    (one split for a whole outline, curves included), or work planes through each straight line square to the sketch
+    (each plane splits right across the face). A plate placed turned over shows its other face: split both.
 
     sketch: sketch index (0 = the current one)
     faces: face indices to split (default: every face the lines cross)
+    tool: auto (paths, then a surface, then planes), lines, surface or plane
     """
     cd = s.cdef()
     sk = s.sketch(sketch)
@@ -276,22 +357,66 @@ def split_faces(s: Session, sketch: int = 0, faces: list[int] | None = None) -> 
              (K.kSketchLineObject, K.kSketchArcObject, K.kSketchCircleObject) and not safe(lambda c=c: c.Construction, False)]
     if not lines:
         raise InventorError("the sketch has no lines to split with")
+    mode = (tool or "auto").strip().lower()
+    if mode not in ("auto", "lines", "surface", "plane"):
+        raise InventorError("tool must be auto, lines, surface or plane")
     before = s.snapshot()
     sf = cd.Features.SplitFeatures
     planes = [_plane_of(s.face(i)) for i in faces or []]
     if any(p is None for p in planes):
         raise InventorError("split_faces with listed faces needs flat faces; leave faces out for curved ones")
-    made = []
-    for i, ln in enumerate(lines):           # one line at a time: Inventor refuses a whole sketch
-        path = cd.Features.CreatePath(ln)
-        if faces:                            # earlier splits replace the faces, so find the pieces again each time
-            targets = [f for f in s.faces() if (lambda q: q is not None and any(_coplanar(q, p) for p in planes))(_plane_of(f))]
-            made.append(sf.SplitFaces(path, False, s.face_collection(targets)).Name)
-        else:
-            made.append(sf.SplitFaces(path, True, s.body()).Name)
-        if i == 0:                           # the first split consumes the sketch; only then can it be shared
-            safe(lambda: setattr(sk, "Shared", True))
+    made, tried = [], []
+
+    def by_lines():
+        for i, ln in enumerate(lines):           # one line at a time: Inventor refuses a whole sketch
+            made.append(_split_with(s, sf, cd.Features.CreatePath(ln), faces, planes).Name)
+            if i == 0:                           # the first split consumes the sketch; only then can it be shared
+                safe(lambda: setattr(sk, "Shared", True))
+
+    def by_surface():
+        safe(lambda: setattr(sk, "Shared", True))
+        ef = cd.Features.ExtrudeFeatures
+        for rep in _chains(cd, lines):
+            prof = sk.Profiles.AddForSurface(rep)
+            ed = ef.CreateExtrudeDefinition(prof, K.kSurfaceOperation)
+            ed.SetDistanceExtent(_extent_cm(cd), K.kSymmetricExtentDirection)
+            feat = ef.Add(ed)
+            ws = cd.WorkSurfaces.Item(cd.WorkSurfaces.Count)
+            safe(lambda: setattr(ws, "Visible", False))
+            made.append(_split_with(s, sf, ws, faces, planes).Name + f" (surface {feat.Name})")
+
+    def by_plane():
+        straight = [c for c in lines if safe(lambda c=c: c.Type) == K.kSketchLineObject]
+        if not straight:
+            raise InventorError("plane splitting needs straight lines")
+        import math as _m
+        for ln in straight:
+            wp = cd.WorkPlanes.AddByLinePlaneAndAngle(ln, sk.PlanarEntity, _m.pi / 2)
+            safe(lambda wp=wp: setattr(wp, "Visible", False))
+            made.append(_split_with(s, sf, wp, faces, planes).Name + f" (plane {wp.Name})")
+
+    order = {"auto": [("lines", by_lines), ("surface", by_surface), ("plane", by_plane)],
+             "lines": [("lines", by_lines)],
+             "surface": [("surface", by_surface)], "plane": [("plane", by_plane)]}[mode]
+    used, errors = "", []
+    for label, fn in order:
+        n0 = len(made)
+        try:
+            fn()
+            used = label
+            break
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{label}: {e}")
+            tried.append(label)
+            if len(made) > n0:              # part of it went through: don't stack a second method on top
+                used = label + " (partly)"
+                break
+    if not made:
+        raise InventorError("Inventor refused every way of splitting with this sketch (" + "; ".join(errors)[:600] +
+                            "). Check the lines cross the faces, or give faces explicitly")
     out = s.delta("split_faces", before)
     out.pop("warning", None)
-    out["features"] = made
+    out.update(features=made, tool=used)
+    if tried:
+        out["fell_back_from"] = tried
     return out

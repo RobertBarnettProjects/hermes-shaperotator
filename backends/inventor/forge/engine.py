@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import sys
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -11,6 +12,7 @@ from typing import Any
 
 from .standards import StandardError
 from .com import Apartment, InventorError, com_error_text, safe
+from .health import FailureMemory, HangWatch, keep_awake
 from .registry import TOOLS, load_all
 from .session import Session
 
@@ -24,6 +26,53 @@ def _plain(v: Any) -> Any:
     if v is None or isinstance(v, (str, int, float, bool)):
         return v
     return str(v)
+
+
+def _paths(v, out: list) -> None:
+    if isinstance(v, dict):
+        for x in v.values():
+            _paths(x, out)
+    elif isinstance(v, list):
+        for x in v:
+            _paths(x, out)
+    elif isinstance(v, str) and len(v) > 3 and os.path.isabs(v) and os.path.splitext(v)[1]:
+        out.append(v)
+
+
+def compact(res: dict) -> dict:
+    """A shorter result for the compact output mode: file paths that share a folder are given relative to it (the
+    folder is stated once), and a note repeated in every row of a list is kept only in the first."""
+    found: list = []
+    _paths(res, found)
+    base = ""
+    if len(found) >= 2:
+        try:
+            base = os.path.commonpath([os.path.dirname(p) for p in found])
+        except ValueError:
+            base = ""
+
+    def walk(v):
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            seen = set()
+            rows = []
+            for x in v:
+                x = walk(x)
+                if isinstance(x, dict) and isinstance(x.get("note"), str):
+                    if x["note"] in seen:
+                        x = {k: y for k, y in x.items() if k != "note"}
+                    else:
+                        seen.add(x["note"])
+                rows.append(x)
+            return rows
+        if base and isinstance(v, str) and v in found:
+            return os.path.relpath(v, base)
+        return v
+    out = walk(res)
+    if base:
+        out["folder"] = base
+    return out
 
 
 RPC_BUSY = (-2147418111, -2147417846)     # RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER
@@ -78,6 +127,7 @@ class Forge:
         self.session = Session(visible=visible)
         self.tools = TOOLS
         self.pending: dict | None = None          # a call left waiting on Inventor (a dialog, or too slow)
+        self.failures = FailureMemory()
         self._pending_lock = threading.Lock()
         self.session.forge = self
 
@@ -93,6 +143,13 @@ class Forge:
         unknown = [k for k in args if k not in params]
         if unknown:
             raise InventorError(f"{name}: unknown argument(s) {unknown}; expected {params}")
+
+        if t.com and self.failures.blocked(name, args):
+            raise InventorError(f"{name} has already failed twice in a row with these arguments and the same error "
+                                f"({self.failures.key[2][:300]}); it is not sent a third time, because repeating it "
+                                "won't help and runs of failing calls have come before Inventor crashes. Change the "
+                                "arguments, check the model (list_features, inspect) or try the step in a private "
+                                "Inventor first")
 
         if not t.com:               # reads Windows state only: must not wait behind a running solve
             out = t.fn(self.session, **args)
@@ -113,13 +170,18 @@ class Forge:
                                             "then try again.") from e
                     time.sleep(1.5)
 
+        t_submit = time.time()
+
         def run():
+            t_run = time.time()
             busy = self.session.solver_busy()
             if busy:
                 raise InventorError(f"Inventor is running a solve or report ({busy[0]!r}); calling it now can crash it. "
                                     "Wait until that finishes (solve_state shows progress), or close the dialog if it is idle.")
+            long_call = t.group == "analysis" or "timeout" in inspect.signature(t.fn).parameters
             try:
-                out = attempt()
+                with keep_awake(long_call):
+                    out = attempt()
             except InventorError:
                 raise
             except StandardError as e:
@@ -133,10 +195,18 @@ class Forge:
                     from .hints import hint_for
                     text = com_error_text(e)
                     h = hint_for(name, text)
+                    again = self.failures.failed(name, args, text)
                     raise InventorError(f"{name}: Inventor rejected the operation — {text}"
-                                        + (f". Try: {h}" if h else "")) from e
+                                        + (f". Try: {h}" if h else "")
+                                        + (". This is the second identical failure in a row, so the same call will "
+                                           "be refused if sent again unchanged" if again >= 2 else "")) from e
                 raise
+            self.failures.succeeded()
             res = _plain(out) if isinstance(out, dict) else {"result": _plain(out)}
+            if getattr(self.session, "timings", False):
+                res["timing"] = {"queued_s": round(t_run - t_submit, 3), "inventor_s": round(time.time() - t_run, 3)}
+            if getattr(self.session, "compact", False):
+                res = compact(res)
             if t.mutates:
                 note = safe(lambda: self.session.focus_note(), "")
                 if note:
@@ -163,11 +233,30 @@ class Forge:
             fut = self.apartment.submit(run)
         t0 = time.time()
         limit = float("inf") if wait is None else float(wait)
+        watch = HangWatch(pid, getattr(self.session, "hwnd", None)) if pid else None
+        slow: list[str] = []
         while True:
             try:
-                return fut.result(timeout=min(2.0, max(0.1, t0 + limit - time.time())))
+                res = fut.result(timeout=min(2.0, max(0.1, t0 + limit - time.time())))
+                if slow and isinstance(res, dict):
+                    res["slow_call"] = slow[-1]
+                return res
             except FutureTimeout:
                 pass
+            state = watch.sample() if watch is not None else "ok"
+            if state == "warn":
+                slow.append(f"{watch.reason} for {watch.stuck_for():.0f} s during this call")
+                print(f"inventor-forge: {name}: {slow[-1]}", file=sys.stderr, flush=True)
+            elif state == "stop":
+                from . import uidrive as U
+                dialogs = safe(lambda: U.dialog_rows(pid), []) or []
+                with self._pending_lock:
+                    self.pending = {"tool": name, "future": fut, "started": t0, "dialogs": dialogs}
+                raise InventorError(f"{name}: {watch.reason} for {watch.stuck_for():.0f} s, so this call was given "
+                                    "up on (INVENTOR_FORGE_HANG_STOP sets the limit)"
+                                    + (f". Inventor shows: {_dialog_text(dialogs)}" if dialogs else "")
+                                    + ". The call may still finish: pending_call shows it. If Inventor stays stuck, "
+                                    "save nothing more in it; a private Inventor can be closed and started again")
             if time.time() - t0 >= limit:
                 with self._pending_lock:
                     self.pending = {"tool": name, "future": fut, "started": t0, "dialogs": []}

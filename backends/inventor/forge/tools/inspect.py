@@ -119,7 +119,7 @@ def point_inside(body, xyz_cm) -> bool | None:
     return None
 
 
-def find_planar_face(s: Session, axis: str = "Z", at: list[float] | None = None):
+def find_planar_face(s: Session, axis: str = "Z", at: list[float] | None = None, body=None):
     """Outermost planar face whose outward normal is +axis (e.g. the top face for Z). With ``at``
     (the two other coordinates, mm, in X-Y-Z order), only faces that actually lie over that point count —
     so a hole on a stepped part starts on the step it is drilled through, not the highest face."""
@@ -127,7 +127,7 @@ def find_planar_face(s: Session, axis: str = "Z", at: list[float] | None = None)
     sign = -1 if axis.strip().startswith("-") else 1
     rest = [i for i in range(3) if i != ai]
     best, best_val = None, -1e18
-    for f in s.faces():
+    for f in s.faces(body):
         if f.SurfaceType != K.kPlaneSurface:
             continue
         n = face_normal(f)
@@ -142,8 +142,8 @@ def find_planar_face(s: Session, axis: str = "Z", at: list[float] | None = None)
             lvl = [p.X, p.Y, p.Z][ai]
             below, above = list(q), list(q)
             below[ai], above[ai] = lvl - sign * 0.002, lvl + sign * 0.002
-            body = s.body()
-            if point_inside(body, below) is not True or point_inside(body, above) is not False:
+            solid = s.body(body)
+            if point_inside(solid, below) is not True or point_inside(solid, above) is not False:
                 continue
         if v > best_val:
             best, best_val = f, v
@@ -172,35 +172,41 @@ def inspect(s: Session) -> dict:
 
 
 @tool("inspect", mutates=False)
-def list_faces(s: Session, min_area: float = 0.0, type: str = "", max_count: int = 80) -> dict:
+def list_faces(s: Session, min_area: float = 0.0, type: str = "", max_count: int = 80, body: str = "") -> dict:
     """Face table: index, type (plane/cylinder/...), area, centroid, outward normal or diameter/axis,
-    and hole=true for concave cylinders. Indices are what fillet/shell/hole/FEA tools take.
+    and hole=true for concave cylinders. Indices are what fillet/shell/hole/FEA tools take (per body).
 
     type: filter, e.g. plane or cylinder
+    body: which body of a multi-body part (name or index; default the first)
     """
     rows = []
-    for i, f in enumerate(s.faces(), 1):
+    for i, f in enumerate(s.faces(body), 1):
         row = face_row(s, i, f)
         if row["area_mm2"] < min_area or (type and row["type"] != type):
             continue
         rows.append(row)
         if len(rows) >= max_count:
             break
-    return {"faces": rows, "total_faces": s.body().Faces.Count}
+    return {"faces": rows, "total_faces": s.body(body).Faces.Count, "body": safe(lambda: s.body(body).Name, "")}
 
 
 @tool("inspect", mutates=False)
-def list_edges(s: Session, min_length: float = 0.0, type: str = "", max_count: int = 100) -> dict:
-    """Edge table: index, type (line/circle/arc...), length, midpoint, diameter/centre for circles."""
+def list_edges(s: Session, min_length: float = 0.0, type: str = "", max_count: int = 100, body: str = "") -> dict:
+    """Edge table: index, type (line/circle/arc...), length, midpoint, diameter/centre for circles. For picking a few
+    edges, select_edges filters on the server and returns only their indices.
+
+    body: which body of a multi-body part (name or index; default the first)
+    """
     rows = []
-    for i, e in enumerate(s.edges(), 1):
+    for i, e in enumerate(s.edges(body), 1):
         row = edge_row(i, e)
         if row.get("length_mm", 0) < min_length or (type and row["type"] != type):
             continue
         rows.append(row)
         if len(rows) >= max_count:
             break
-    return {"edges": rows, "total_edges": s.body().Edges.Count}
+    return {"edges": rows, "total_edges": s.body(body).Edges.Count, "returned": len(rows),
+            "body": safe(lambda: s.body(body).Name, "")}
 
 
 def _near(a, b) -> float:
@@ -209,32 +215,49 @@ def _near(a, b) -> float:
 
 @tool("inspect", mutates=False)
 def find_edge(s: Session, x: float | None = None, y: float | None = None, z: float | None = None,
-              type: str = "", tolerance: float = 0.5) -> dict:
+              type: str = "", tolerance: float = 0.5, body: str = "", strict: bool = False) -> dict:
     """Edge(s) whose midpoint is nearest (x, y, z) mm — omitted coordinates are ignored.
-    Returns the best match plus any others within tolerance."""
+    Returns the best match plus any others within tolerance. body="all" searches every body of a multi-body part
+    and says which body the edge is on (indices are per body).
+
+    body: body name or index, or "all" (default the first body)
+    strict: refuse when the nearest edge is further than tolerance (instead of returning it with its distance)
+    """
     target = [x, y, z]
     scored = []
-    for i, e in enumerate(s.edges(), 1):
-        row = edge_row(i, e)
-        if type and row["type"] != type or "midpoint_mm" not in row:
-            continue
-        scored.append((_near(row["midpoint_mm"], target), row))
+    bodies = s.bodies_named(body) if body else [s.body()]
+    for b in bodies:
+        bname = safe(lambda b=b: b.Name, "")
+        for i, e in enumerate(items(b.Edges), 1):
+            row = edge_row(i, e)
+            if type and row["type"] != type or "midpoint_mm" not in row:
+                continue
+            row["body"] = bname
+            scored.append((_near(row["midpoint_mm"], target), row))
     if not scored:
         raise InventorError("no edges")
     scored.sort(key=lambda t: t[0])
     best = scored[0]
-    return {"edge": best[1]["index"], "distance_mm": r(best[0]), "match": best[1],
-            "also_within_tolerance": [rw["index"] for d, rw in scored[1:] if d - best[0] <= tolerance]}
+    if strict and best[0] > tolerance:
+        raise InventorError(f"no edge within {tolerance} mm: the nearest is edge {best[1]['index']} on "
+                            f"{best[1]['body']} at {best[0]:.3f} mm")
+    out = {"edge": best[1]["index"], "body": best[1]["body"], "distance_mm": r(best[0]), "match": best[1],
+           "also_within_tolerance": [(rw["index"], rw["body"]) if len(bodies) > 1 else rw["index"]
+                                     for d, rw in scored[1:] if d - best[0] <= tolerance]}
+    if best[0] > tolerance:
+        out["warning"] = f"the nearest edge is {best[0]:.3f} mm away, outside the tolerance"
+    return out
 
 
 @tool("inspect", mutates=False)
 def find_face(s: Session, x: float | None = None, y: float | None = None, z: float | None = None,
-              normal: list[float] | None = None, type: str = "", min_area: float = 0.0) -> dict:
+              normal: list[float] | None = None, type: str = "", min_area: float = 0.0, body: str = "") -> dict:
     """Face nearest a point (centroid distance) and/or best aligned with an outward normal.
 
     normal: e.g. [0, 0, 1] — with no coordinates, returns the outermost face facing that way
+    body: body name or index of a multi-body part (default the first)
     """
-    rows = [face_row(s, i, f) for i, f in enumerate(s.faces(), 1)]
+    rows = [face_row(s, i, f) for i, f in enumerate(s.faces(body), 1)]
     rows = [rw for rw in rows if rw["area_mm2"] >= min_area and (not type or rw["type"] == type)]
     if normal:
         nn = math.sqrt(sum(v * v for v in normal)) or 1
@@ -280,10 +303,22 @@ def mass_properties(s: Session) -> dict:
 
 
 @tool("inspect", mutates=False)
-def measure(s: Session, face_one: int = 0, face_two: int = 0, edge_one: int = 0, edge_two: int = 0) -> dict:
-    """Minimum distance (and angle between planar faces) for two faces, two edges, or a face and an edge."""
-    ents = [s.face(face_one) if face_one else None, s.face(face_two) if face_two else None,
-            s.edge(edge_one) if edge_one else None, s.edge(edge_two) if edge_two else None]
+def measure(s: Session, face_one: int = 0, face_two: int = 0, edge_one: int = 0, edge_two: int = 0,
+            body_one: str = "", body_two: str = "") -> dict:
+    """Minimum distance (and angle between planar faces) for two faces, two edges, or a face and an edge. In a
+    multi-body part each entity can come from its own body.
+
+    body_one: body of the first entity (face_one or edge_one); body_two: of the second (default the first body)
+    """
+    b1, b2 = body_one or None, body_two or body_one or None
+    if face_one and face_two:
+        ents = [s.face(face_one, b1), s.face(face_two, b2)]
+    elif edge_one and edge_two:
+        ents = [s.edge(edge_one, b1), s.edge(edge_two, b2)]
+    else:
+        ents = [s.face(face_one, b1) if face_one else None, s.edge(edge_one, b1 if not face_one else b2)
+                if edge_one else None, s.face(face_two, b2) if face_two else None,
+                s.edge(edge_two, b2) if edge_two else None]
     ents = [e for e in ents if e is not None]
     if len(ents) != 2:
         raise InventorError("give exactly two entities")
@@ -328,22 +363,69 @@ def get_parameters(s: Session, user_only: bool = False) -> dict:
     return out
 
 
+def placement_boxes(s: Session, d) -> dict:
+    """Range box (mm, min xyz + max xyz) of every leaf component of an assembly, or every body of a part, by name."""
+    out: dict = {}
+    kind = s.kind(d)
+    if kind == "assembly":
+        for o in items(safe(lambda: d.ComponentDefinition.Occurrences.AllLeafOccurrences) or []):
+            path = (safe(lambda o=o: "/".join(x.Name for x in items(o.OccurrencePath)), "")
+                    or safe(lambda o=o: o.Name, "?"))
+            rb = safe(lambda o=o: o.RangeBox)
+            if rb is not None and not safe(lambda o=o: o.Suppressed, False):
+                out[path] = tuple(_mm(rb.MinPoint) + _mm(rb.MaxPoint))
+    elif kind == "part":
+        for i, b in enumerate(items(safe(lambda: d.ComponentDefinition.SurfaceBodies) or []), 1):
+            rb = safe(lambda b=b: b.RangeBox)
+            if rb is not None:
+                out[safe(lambda b=b: b.Name, "") or f"body {i}"] = tuple(_mm(rb.MinPoint) + _mm(rb.MaxPoint))
+    return out
+
+
+def box_changes(before: dict, after: dict, tol: float = 0.001) -> list[dict]:
+    """What moved or changed size between two placement_boxes readings: centre shift and size change per item."""
+    rows = []
+    for name in list(before) + [n for n in after if n not in before]:
+        a, b = before.get(name), after.get(name)
+        if a is None:
+            rows.append({"name": name, "change": "appeared", "box_mm": list(b)})
+            continue
+        if b is None:
+            rows.append({"name": name, "change": "gone"})
+            continue
+        shift = [r((b[i] + b[i + 3] - a[i] - a[i + 3]) / 2) for i in range(3)]
+        size = [r((b[i + 3] - b[i]) - (a[i + 3] - a[i])) for i in range(3)]
+        if any(abs(v) > tol for v in shift + size):
+            rows.append({"name": name, "change": "moved" if not any(abs(v) > tol for v in size) else "resized",
+                         "centre_shift_mm": shift, "size_change_mm": size})
+    return rows
+
+
 @tool("parameters")
 def set_parameter(s: Session, name: str, expression: str) -> dict:
-    """Set a parameter's expression (e.g. "40 mm", "d0 * 2", "Thickness + 2") and rebuild."""
+    """Set a parameter's expression (e.g. "40 mm", "d0 * 2", "Thickness + 2") and rebuild. Reports every body (part) or
+    component (assembly) whose range box moved or changed size, so knock-on effects of a parameter that other features
+    hang off are visible before analysis or drawings."""
     ps = _params(s)
     try:
         p = ps.Item(name)
     except Exception:
         raise InventorError(f"no parameter {name!r} (see get_parameters)") from None
-    before = s.snapshot() if s.kind() == "part" else None
+    d = s.doc()
+    before = s.snapshot() if s.kind(d) == "part" else None
+    boxes = placement_boxes(s, d)
     if str(expression).replace(".", "", 1).lstrip("-").isdigit() and safe(lambda: p.Units, "") in ("mm", "cm"):
         expression = f"{expression} mm"
     p.Expression = str(expression)
-    s.doc().Update()
+    d.Update()
     out = {"parameter": _param_row(p)}
     if before is not None:
         out.update(s.delta(f"Param {name}", before))
+    changes = box_changes(boxes, placement_boxes(s, d))
+    out["changed"] = changes[:40]
+    out["unchanged"] = len(boxes) - sum(1 for c in changes if c["change"] != "appeared")
+    if len(changes) > 40:
+        out["changed_total"] = len(changes)
     return out
 
 

@@ -786,7 +786,31 @@ def _convergence(s: Session, pid: int, refinements: int, stop_percent: float) ->
     _ok(pid, h, "Convergence Settings")
 
 
-def _auto_contacts(s: Session, pid: int) -> None:
+MESH_WINDOWS = ("mesh", "progress")
+
+
+def update_mesh(s: Session, pid: int, timeout: float = 900.0) -> float:
+    """Mesh the active study again from the current geometry (Inventor's Update Mesh) and wait for it with Windows
+    calls only. Automatic contacts work on the last mesh: without this, parts added or moved since get no contacts
+    and nothing says so. Returns seconds taken."""
+    known = {h for h, _c, _t in U.window_rows(pid)}
+    _run_command(s, "FeaUpdateMeshCmd")
+    t0 = time.time()
+    time.sleep(1.5)
+    while time.time() - t0 < timeout:
+        busy = [t for h, c, t in U.window_rows(pid)
+                if h not in known and c == "#32770" and any(k in t.lower() for k in MESH_WINDOWS)]
+        if not busy:
+            break
+        time.sleep(1.0)
+    else:
+        raise InventorError(f"meshing was still running after {timeout:.0f} s")
+    return time.time() - t0
+
+
+def _auto_contacts(s: Session, pid: int, mesh_first: bool = True) -> None:
+    if mesh_first:
+        safe(lambda: update_mesh(s, pid))
     _run_command(s, "FeaCreateContactAutoCmd")
     t0 = time.time()
     while time.time() - t0 < 120:                      # large assemblies take a while; a small dialog may report it
@@ -873,6 +897,7 @@ def _mesh(s: Session, pid: int, avg_fraction: float, allow_typing: bool = True) 
 def _simulate(s: Session, pid: int, timeout: float = 3600.0, front: bool = True) -> tuple[float, list[str]]:
     """Run the active study and wait for it using Windows calls only (Inventor can crash if it gets COM calls
     during a solve). Returns seconds taken and any solver warnings."""
+    solve_slot(pid)
     _run_command(s, "FeaSimulateCmd")
     h = _dialog(pid, "Simulate", front=front)
     t0 = time.time()
@@ -915,6 +940,20 @@ def _simulate(s: Session, pid: int, timeout: float = 3600.0, front: bool = True)
 
 
 FATAL_SOLVE = ("degenerate element", "negative jacobian", "distorted element")
+MAX_SOLVES = 2             # concurrent solves on one PC (INVENTOR_FORGE_MAX_SOLVES)
+
+
+def solve_slot(own_pid: int) -> None:
+    """Refuse to start a solve while the PC already runs the most it should: with three at once on a 32 GB machine
+    one Inventor stopped responding and another failed to save a finished result."""
+    try:
+        limit = int(os.environ.get("INVENTOR_FORGE_MAX_SOLVES", "") or MAX_SOLVES)
+    except ValueError:
+        limit = MAX_SOLVES
+    others = [p for p in U.pids_named("Inventor.exe") if p != own_pid and U.solver_windows([p])]
+    if len(others) >= limit:
+        raise InventorError(f"{len(others)} other Inventor(s) are solving (processes {others}) and the limit is "
+                            f"{limit} at once; the PC is busy, so wait for one to finish (solve_state shows them)")
 
 
 def _answer_results_prompt(pid: int) -> int:

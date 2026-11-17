@@ -6,6 +6,22 @@ import re
 
 # (tool name pattern, error text pattern or "", hint). First match wins.
 HINTS: list[tuple[str, str, str]] = [
+    (r"", r"e_invalidarg|invalid argument|-2147024809", "an optional argument may need to be missing rather than None, "
+                                                       "or an array typed (prompt strings: VT_ARRAY | VT_BSTR); "
+                                                       "guide('session') has the COM rules"),
+    (r"^(extrude|parametric_extrusion|parametric_profile)$", r"addforsolid|profile",
+     "a part that is invisible while other documents are open can refuse profiles: make it visible and active "
+     "(activate_document); check_sketch lists open ends"),
+    (r"^split_faces$", r"", "a sketch can't be the tool: split_faces(tool='surface') extrudes it as a hidden surface, "
+                            "tool='plane' uses work planes"),
+    (r"^(add_title_block|set_sheet_format|set_prompted_fields)$", r"",
+     "prompt names must be unique in the definition; values go in the definition's prompt order"),
+    (r"^(solve_study|run_study_cases|mesh_convergence)$", r"degenerate|jacobian",
+     "suppress parts one at a time and solve to find the culprit; look for slivers and near-tangent contacts"),
+    (r"^(update_contacts|set_contact_type|list_contacts)$", r"",
+     "update the mesh first (update_contacts) and list contacts back; guide('stress-analysis')"),
+    (r"^copy_assembly$", r"", "the source must be saved and closed cleanly; check its missing references first "
+                              "(open_document lists them)"),
     (r"^fillet$", r"", "the radius may be too big for the faces next to that edge, or the edge numbers changed after "
                       "the last feature: re-read them with list_edges / find_edge and try a smaller radius first"),
     (r"^chamfer$", r"", "the distance may be bigger than the faces it cuts into, or the edge numbers changed: re-read "
@@ -32,8 +48,13 @@ HINTS: list[tuple[str, str, str]] = [
                                                          "(create_part(sheet_metal=true)) and an edge of the existing "
                                                          "face for flanges"),
     (r"^circular_pattern$|^rectangular_pattern$", r"", "pattern the feature by its name from list_features, and check "
-                                                      "the axis exists (X, Y, Z or a work axis)"),
-    (r"^export", r"", "close the file if it is open elsewhere, and check the folder is writable"),
+                                                      "the axis exists (X, Y, Z or a work axis); a pattern of a "
+                                                      "feature in a multi-body part may need its body: draw every "
+                                                      "instance in one sketch and cut once with body="),
+    (r"^export", r"3mf", "this Inventor's 3MF translator refused the document: export_print_package writes a "
+                         "millimetre 3MF from the STL mesh instead; export_capabilities lists the translators"),
+    (r"^export", r"", "export_capabilities lists the translators this Inventor has; close the file if it is open "
+                      "elsewhere, and check the folder is writable"),
     (r"", r"busy|refused", "a dialog may be open in Inventor: pending_call shows it"),
 ]
 

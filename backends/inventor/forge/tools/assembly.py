@@ -1,6 +1,7 @@
 """Assemblies: placing, constraining, grounding, moving, interference, BOM."""
 from __future__ import annotations
 
+import contextlib
 import csv
 import math
 import os
@@ -18,13 +19,8 @@ def _occ(s: Session, name: str):
         if not 1 <= i <= occs.Count:
             raise InventorError(f"occurrence {i} out of range 1..{occs.Count}")
         return occs.Item(i)
-    for o in items(occs):
-        if o.Name.lower() == str(name).lower():
-            return o
-    for o in items(occs):
-        if o.Name.lower().startswith(str(name).lower()):
-            return o
-    raise InventorError(f"no occurrence {name!r} (see inspect_assembly)")
+    from .drawing import exact_occurrence
+    return exact_occurrence(list(items(occs)), str(name))
 
 
 def _proxy(occ, geometry):
@@ -73,7 +69,9 @@ def _occ_row(o) -> dict:
 def place_component(s: Session, path: str, x: float = 0.0, y: float = 0.0, z: float = 0.0,
                     rotate_axis: str = "", rotate_angle: float = 0.0, grounded: bool = False) -> dict:
     """Place a part/assembly file (or an open document by name) into the active assembly at (x, y, z) mm,
-    optionally rotated about X/Y/Z by rotate_angle degrees. The first component is usually grounded."""
+    optionally rotated about X/Y/Z by rotate_angle degrees. The first component is usually grounded. In an assembly
+    with several model states the component is added to every state (Inventor otherwise adds it to the active one
+    only)."""
     asm = s.assembly()
     full = path
     if not os.path.isabs(full) or not os.path.exists(full):
@@ -91,10 +89,30 @@ def place_component(s: Session, path: str, x: float = 0.0, y: float = 0.0, z: fl
         ax = {"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[rotate_axis.upper()]
         m.SetToRotation(math.radians(rotate_angle), tg.CreateVector(*ax), tg.CreatePoint(0, 0, 0))
     m.SetTranslation(tg.CreateVector(x * MM, y * MM, z * MM))
-    occ = asm.ComponentDefinition.Occurrences.Add(full, m)
-    if grounded:
-        occ.Grounded = True
-    return {"placed": _occ_row(occ), "occurrences": asm.ComponentDefinition.Occurrences.Count}
+    with all_members(asm) as states:
+        occ = asm.ComponentDefinition.Occurrences.Add(full, m)
+        if grounded:
+            occ.Grounded = True
+    out = {"placed": _occ_row(occ), "occurrences": asm.ComponentDefinition.Occurrences.Count}
+    if states > 1:
+        out["model_states"] = f"added to all {states} model states"
+    return out
+
+
+@contextlib.contextmanager
+def all_members(doc):
+    """While inside, edits to an assembly or part with several model states go to every state (MemberEditScope =
+    all members) instead of only the active one. Yields the number of model states."""
+    states = safe(lambda: doc.ComponentDefinition.ModelStates)
+    n = safe(lambda: states.Count, 0) or 0
+    was = safe(lambda: states.MemberEditScope) if n > 1 else None
+    if n > 1:
+        safe(lambda: setattr(states, "MemberEditScope", K.kEditAllMembers))
+    try:
+        yield n
+    finally:
+        if was is not None:
+            safe(lambda: setattr(states, "MemberEditScope", was))
 
 
 @tool("assembly")
@@ -338,3 +356,199 @@ def sweep_clearance(s: Session, constraint: str, start: float, stop: float, step
             "tightest_clearance": {"at": tightest["value"], "gap_mm": tightest["min_gap_mm"], "to": tightest["nearest"]}
             if tightest else None,
             "restored": original}
+
+
+# --------------------------------------------------------------------------- copying an assembly
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path or ""))
+
+
+def renamed(name: str, prefix: str, old_prefix: str = "") -> str:
+    """A file name with a new prefix: old_prefix replaced when the name starts with it, else prefix added. Only the
+    file name changes, never a folder (a text replace on whole paths also rewrites folders that share the prefix)."""
+    stem, ext = os.path.splitext(name)
+    if old_prefix and stem.lower().startswith(old_prefix.lower()):
+        stem = stem[len(old_prefix):]
+    return prefix + stem + ext
+
+
+def copy_plan(files: list[str], root: str, folder: str, prefix: str, old_prefix: str = "") -> dict:
+    """{old path: new path} for every file under root: the same sub-folders under folder, file names renamed."""
+    root_n = _norm(root).rstrip("\\/") + os.sep
+    plan = {}
+    for f in files:
+        n = _norm(f)
+        if not n.startswith(root_n):
+            continue
+        rel = os.path.relpath(os.path.dirname(os.path.abspath(f)), os.path.abspath(root))
+        sub = "" if rel == "." else rel
+        plan[n] = os.path.join(os.path.abspath(folder), sub, renamed(os.path.basename(f), prefix, old_prefix))
+    return plan
+
+
+def _walk_files(top) -> tuple[dict, list]:
+    """Every file reachable through File.ReferencedFileDescriptors (which, unlike AllReferencedDocuments, includes
+    files used only in model states that aren't active), and the references that are missing."""
+    files, missing = {}, []
+    todo = [top]
+    while todo:
+        f = todo.pop()
+        fn = _norm(safe(lambda f=f: f.FullFileName, ""))
+        if not fn or fn in files:
+            continue
+        files[fn] = f
+        for fd in items(safe(lambda f=f: f.ReferencedFileDescriptors) or []):
+            if safe(lambda fd=fd: fd.ReferenceMissing, False):
+                missing.append(safe(lambda fd=fd: fd.FullFileName, "?"))
+                continue
+            rf = safe(lambda fd=fd: fd.ReferencedFile)
+            if rf is not None:
+                todo.append(rf)
+    return files, missing
+
+
+def _links_into(top, root: str) -> list[dict]:
+    """References anywhere in the tree that still point into root."""
+    root_n = _norm(root).rstrip("\\/") + os.sep
+    out = []
+    files, _ = _walk_files(top)
+    for fn, f in files.items():
+        for fd in items(safe(lambda f=f: f.ReferencedFileDescriptors) or []):
+            target = _norm(safe(lambda fd=fd: fd.FullFileName, ""))
+            if target.startswith(root_n):
+                out.append({"in": os.path.basename(fn), "to": safe(lambda fd=fd: fd.FullFileName, "")})
+    return out
+
+
+def _contact_table(s: Session) -> dict | None:
+    """{(study, contact): type} when the document has Stress Analysis studies with loads, else None."""
+    from .studies import _contacts, _label, _sa_params, _study_nodes
+    if not safe(lambda: _sa_params(s), {}):
+        return None
+    table = {}
+    for study in _study_nodes(s):
+        for g, c in _contacts(s, study):
+            table[f"{study} | {_label(c)}"] = _label(g)
+    return table
+
+
+@tool("assembly")
+def copy_assembly(s: Session, folder: str, prefix: str = "", old_prefix: str = "", source_root: str = "",
+                  check_contacts: bool = True) -> dict:
+    """Copy the active (saved) assembly and every file it uses from its own folder tree into a new folder, renaming
+    the files with a prefix, then point every reference in the copies at the copied files and check that none still
+    leads back. References are read from the files themselves, so parts used only in model states that aren't active
+    are copied and repointed too (Inventor's Save As leaves those linked to the originals without saying so). Files
+    outside the source folder (library and Content Center parts) stay shared. Stress Analysis results files are not
+    copied: solve the copies again. Contact types are compared before and after the repoint, because a replaced
+    reference can drop contacts that automatic contacts then recreate as Bonded. The source assembly is closed first
+    (it must have no unsaved changes) and the copy is left open.
+
+    folder: destination folder (must not already hold files of the same names)
+    prefix: put in front of every copied file name (or in place of old_prefix)
+    old_prefix: the prefix the source files' names start with, replaced by prefix
+    source_root: the folder whose files are copied (default: the assembly's folder)
+    check_contacts: compare Stress Analysis contact types before and after the repoint (enters Stress Analysis when
+      the assembly has studies)
+    """
+    import shutil
+
+    from ..writes import guard
+    from .docs import _dialog_watchdog, _silent
+    d = s.assembly()
+    src = safe(lambda: d.FullFileName, "")
+    if not src:
+        raise InventorError("save the assembly first; copy_assembly copies files")
+    if safe(lambda: d.Dirty, False) or any(safe(lambda x=x: x.Dirty, False) for x in items(d.AllReferencedDocuments)):
+        raise InventorError("the assembly or one of its parts has unsaved changes; save (or undo) them first so the "
+                            "copy matches what is on disk")
+    root = os.path.abspath(source_root or os.path.dirname(src))
+    folder = os.path.abspath(os.path.join(s.workdir, folder) if not os.path.isabs(folder) else folder)
+    if _norm(folder) == _norm(root):
+        raise InventorError("the destination folder is the source folder; give a new folder")
+    if not prefix and not old_prefix and _norm(folder).startswith(_norm(root).rstrip("\\/") + os.sep):
+        raise InventorError("copying into a sub-folder of the source without a prefix would give files that share "
+                            "names with the originals; give a prefix")
+    files, missing = _walk_files(d.File)
+    if missing:
+        raise InventorError(f"the assembly has missing references ({missing[:6]}); fix them before copying")
+    originals = [safe(lambda f=f: f.FullFileName, "") or n for n, f in files.items()]   # names as written
+    plan = copy_plan(originals, root, folder, prefix, old_prefix)
+    plan.setdefault(_norm(src), os.path.join(folder, renamed(os.path.basename(src), prefix, old_prefix)))
+    clash = [p for p in plan.values() if os.path.exists(p)]
+    if clash:
+        raise InventorError(f"{len(clash)} destination file(s) already exist, e.g. {clash[0]}; choose a new folder or "
+                            "prefix (nothing was copied)")
+    for p in plan.values():
+        guard(p, "copy to")
+    external = sorted(os.path.basename(f) for f in files if f not in plan)
+    new_top = plan[_norm(src)]
+    # close the source so the copy's documents aren't confused with the originals (they share internal names)
+    if s.key(d) == getattr(s, "_current_key", None):
+        s.set_current(None)
+    d.Close(True)
+    for f, dst in plan.items():
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(f, dst)
+    with _silent(s), _dialog_watchdog(s):
+        top = s.app.Documents.Open(new_top, True)
+    top.Activate()
+    s.set_current(top)
+    out = {"copied": len(plan), "top": new_top, "shared_external_files": external[:30]}
+    contacts_before = safe(lambda: _contact_table(s)) if check_contacts else None
+    replaced, failed = 0, []
+    for _ in range(12):                     # nested assemblies: their references appear once their parents point
+        changed = 0
+        tree, _m = _walk_files(top.File)
+        for fn, f in tree.items():
+            for fd in items(safe(lambda f=f: f.ReferencedFileDescriptors) or []):
+                target = plan.get(_norm(safe(lambda fd=fd: fd.FullFileName, "")))
+                if not target:
+                    continue
+                try:
+                    fd.ReplaceReference(target)
+                    changed += 1
+                except Exception as e:  # noqa: BLE001
+                    failed.append(f"{os.path.basename(fn)} -> {os.path.basename(target)}: {e}")
+        replaced += changed
+        if not changed:
+            break
+    safe(lambda: top.Update())
+    out["references_replaced"] = replaced
+    if failed:
+        out["replace_failures"] = sorted(set(failed))[:10]
+    contacts_after = safe(lambda: _contact_table(s)) if contacts_before is not None else None
+    with _silent(s):
+        try:
+            top.Save2(True)
+        except Exception:  # noqa: BLE001
+            top.Save()
+    # verify from the saved files: close and read the links back
+    top.Close(True)
+    s.set_current(None)
+    with _silent(s), _dialog_watchdog(s):
+        top = s.app.Documents.Open(new_top, True)
+    top.Activate()
+    s.set_current(top)
+    still = _links_into(top.File, root)
+    _files, missing_now = _walk_files(top.File)
+    out["still_linked_to_source"] = still[:20]
+    out["missing_after_copy"] = missing_now[:20]
+    out["verified"] = not still and not missing_now
+    if contacts_before is not None:
+        after = contacts_after or {}
+        changed_c = [{"contact": k, "before": v, "after": after.get(k, "(gone)")} for k, v in contacts_before.items()
+                     if after.get(k) != v]
+        added = [k for k in after if k not in contacts_before]
+        out["contacts_checked"] = len(contacts_before)
+        if changed_c or added:
+            out["contacts_changed"] = changed_c[:20]
+            out["contacts_added"] = added[:20]
+            out["warning"] = ("Stress Analysis contacts changed with the repoint; set their types again "
+                              "(set_contact_type) and list them back before solving")
+    elif check_contacts:
+        out["contacts_checked"] = 0
+    if not out["verified"]:
+        out["warning"] = (out.get("warning", "") + "; " if out.get("warning") else "") + \
+            "some references still lead to the source folder or are missing; see still_linked_to_source"
+    return out

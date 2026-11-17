@@ -16,7 +16,7 @@ import re
 import time
 
 from .. import uidrive as U
-from ..com import InventorError, K, items, r, safe
+from ..com import InventorError, K, items, plain_name, r, safe
 from ..registry import tool
 from ..session import Session
 from .fea import (_answer_results_prompt, _enter_analysis, _pid, _report, _run_command, _set_value, _simulate,
@@ -172,7 +172,12 @@ def set_contact_type(s: Session, study: str, between: list[str], type: str) -> d
     type: Bonded, Separation, Sliding / No Separation, Separation / No Sliding, Shrink Fit / Sliding, Shrink Fit / No Sliding, Spring
     """
     n = _set_contact(s, _pid(s), study, between, type)
-    return {"changed": n, "contacts": _contact_rows(s, study)}
+    out = {"changed": n, **_contacts_summary(s, study)}
+    wrong = [c for c in out.get("contacts", []) if all(_mentions(c["contact"], b) or b in c["contact"] for b in between)
+             and c["type"].lower() != type.lower()]
+    if wrong:
+        out["warning"] = f"{len(wrong)} matching contact(s) still aren't {type}: {[c['contact'] for c in wrong][:6]}"
+    return out
 
 
 @tool("analysis")
@@ -425,16 +430,22 @@ def _read_max(s: Session, pid: int, study: str, result: str) -> float:
 
 
 @tool("analysis")
-def read_result_maximum(s: Session, study: str, result: str = "Von Mises Stress") -> dict:
+def read_result_maximum(s: Session, study: str, result: str = "Von Mises Stress", locate: bool = False) -> dict:
     """Peak value of a solved study's result, without generating a report (seconds, against minutes for a file with
-    many studies). Gives peaks only; use study_report for reactions and full results.
+    many studies). Gives peaks only; use study_report for reactions and full results. With locate, also where the peak
+    is: the model is rendered from several directions and the top-colour patch traced back onto it (component, face
+    and an approximate point), because a peak's value means little until it is known whether it sits on a singularity.
 
     result: as named in the study's Results folder, e.g. Von Mises Stress, Displacement, Safety Factor
+    locate: also find where the peak is (a few seconds more; no mouse)
     """
     t0 = time.time()
     STALE.discard(study)
     v = _read_max(s, _pid(s), study, result)
-    out = {"study": study, "result": result, "maximum": v, "seconds": r(time.time() - t0, 1)}
+    out = {"study": study, "result": result, "maximum": v}
+    if locate:
+        out["location"] = peak_location(s)
+    out["seconds"] = r(time.time() - t0, 1)
     if study in STALE:
         out["warning"] = "Inventor said this study's results are out of date (the model changed since it was solved); solve it again"
     return out
@@ -664,16 +675,39 @@ def refresh_analysis_display(s: Session) -> dict:
 
 
 @tool("analysis")
-def solve_study(s: Session, study: str, timeout: float = 3600.0) -> dict:
+def solve_study(s: Session, study: str, timeout: float = 3600.0, skip_unchanged: bool = True) -> dict:
     """Solve an existing study, with no mouse or keyboard use. Don't use Inventor until it returns; solver warnings
-    are returned.
+    are returned. A study whose inputs (geometry, every parameter including load values, and its constraints, loads,
+    contacts and mesh settings) are the same as at its last solve here, and which still has results, is not solved
+    again. At most two solves run on the PC at once.
 
     timeout: seconds to allow the solve
+    skip_unchanged: don't solve again when nothing it depends on has changed
     """
     pid = _pid(s)
     _activate(s, study)
+    log_path = safe(lambda: _solve_log(s))
+    log = {}
+    if log_path and os.path.exists(log_path):
+        log = safe(lambda: json.load(open(log_path, encoding="utf-8")), {}) or {}
+    key = inputs_hash(_study_inputs(s, study))
+    prev = log.get(study, {})
+    if skip_unchanged and prev.get("inputs") == key and _has_results(s, study) and study not in STALE:
+        return {"study": study, "skipped": True, "reason": "inputs unchanged since its last solve, results present",
+                "last_solve_seconds": prev.get("solve_seconds")}
     secs, warnings = _simulate(s, pid, timeout=timeout, front=False)
-    return {"study": study, "solve_seconds": r(secs, 1), "warnings": warnings}
+    STALE.discard(study)
+    if log_path:
+        log[study] = {"inputs": key, "solve_seconds": r(secs, 1), "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        safe(lambda: _store_results(log_path, log))
+    out = {"study": study, "solve_seconds": r(secs, 1), "warnings": warnings}
+    others = [v.get("solve_seconds") for n, v in log.items() if n != study and v.get("solve_seconds")]
+    if len(others) >= 2 and secs < 0.4 * sorted(others)[len(others) // 2]:
+        out["check"] = ("this solve was much faster than the model's other studies: check its contacts "
+                        "(list_contacts); lost contacts make a model come apart and solve quickly")
+    if warnings:
+        out["checks"] = [f"the solver reported {len(warnings)} warning(s); read them before using the results"]
+    return out
 
 
 @tool("analysis")
@@ -702,6 +736,11 @@ def study_report(s: Session, study: str = "", name: str = "", only_this_study: b
         _open_result(s, _pid(s), study, "Von Mises Stress")
     path = _report(s, _pid(s), tag, front=only_this_study, only_study=study if only_this_study else "")
     out = {**parse_report(path, study), "report": path}
+    if out.get("summary"):
+        out["equilibrium"] = equilibrium(out)
+        problems = solve_checks(out)
+        if problems:
+            out["checks"] = problems
     if only_this_study and not out.get("summary"):
         out["note"] = "set-up only: Inventor leaves results out of reports limited to chosen studies; run without only_this_study for results and reactions"
     return out
@@ -822,7 +861,10 @@ def run_study_cases(s: Session, template: str, cases: list[dict], results_path: 
                 s.set_current(s.app.Documents.Open(doc_path, True))
                 pid = _pid(s)
                 _enter_analysis(s)
+    fast = fast_outliers({n: data["cases"][n] for n in names if n in data["cases"]})
     return {"ran": ran, "failed": failed, "already_done": skipped, "inventor_restarts": restarts, "restart_reasons": reasons,
+            **({"check": f"cases {fast} solved much faster than the rest: check their contacts (list_contacts)"}
+               if fast else {}),
             "results_path": path,
             "cases": {n: data["cases"][n] for n in names if n in data["cases"]}}
 
@@ -897,3 +939,399 @@ def solve_state(s: Session) -> dict:
                     "windows": [f"{title} [{cls}]" for _h, cls, title in rows if title][:12]})
     solver = [{"process": p, **U.process_stats(p)} for p in U.pids_named("FEAComputeServer.exe")]
     return {"inventors": out, "solver_processes": solver, "this_session": s.pid}
+
+
+# --------------------------------------------------------------------------- contacts, read back
+def _mentions(label: str, name: str) -> bool:
+    """Does a contact's label name this component (whole name, not a prefix of a longer one)?"""
+    return re.search(r"(?<![\w:])" + re.escape(name) + r"(?![\w:])", label) is not None
+
+
+def contact_report(rows: list[dict], components: list[str], gap=None, tol: float = 0.01) -> dict:
+    """Contacts per component, components with none, and contacts between components that no longer touch.
+
+    rows: [{"contact": label, "type": type}]; components: component names; gap(a, b) -> mm or None."""
+    per: dict = {c: [] for c in components}
+    pairs = []
+    for row in rows:
+        named = [c for c in components if _mentions(row["contact"], c)]
+        for c in named:
+            per[c].append(f"{row['contact']} ({row['type']})")
+        if len(named) == 2:
+            pairs.append((row, named))
+    stale = []
+    if gap is not None:
+        for row, (a, b) in pairs:
+            g = gap(a, b)
+            if g is not None and g > tol:
+                stale.append({"contact": row["contact"], "type": row["type"], "between": [a, b], "gap_mm": r(g, 3)})
+    return {"by_component": {c: v for c, v in per.items()}, "no_contacts": [c for c, v in per.items() if not v],
+            "stale": stale, "count": len(rows)}
+
+
+def _component_gap(s: Session):
+    from .assembly import _occ
+
+    def gap(a: str, b: str):
+        d = safe(lambda: s.app.MeasureTools.GetMinimumDistance(_occ(s, a), _occ(s, b)))
+        d = d[0] if isinstance(d, tuple) else d
+        return None if d is None else d * 10
+    return gap
+
+
+def _contacts_summary(s: Session, study: str) -> dict:
+    rows = _contact_rows(s, study)
+    if s.kind() != "assembly":
+        return {"contacts": rows, "count": len(rows)}
+    comps = [o.Name for o in items(s.doc().ComponentDefinition.Occurrences.AllLeafOccurrences)
+             if not safe(lambda o=o: o.Suppressed, False)]
+    rep = contact_report(rows, comps, _component_gap(s))
+    rep["contacts"] = rows
+    return rep
+
+
+@tool("analysis", mutates=False)
+def list_contacts(s: Session, study: str) -> dict:
+    """A study's contacts read back: each with its type, the contacts of every component, components with none (not
+    attached to anything: the solve would fail or the part float), and contacts between components that no longer
+    touch (left over from an earlier geometry). Check this after every contact change and before solving."""
+    return {"study": study, **_contacts_summary(s, study)}
+
+
+def _delete_node(s: Session, pid: int, node) -> bool:
+    main = s.app.MainFrameHWND
+    _pane(s).Activate()
+    d = s.front()
+    d.SelectSet.Clear()
+    safe(lambda: node.EnsureVisible())
+    node.DoSelect()
+    time.sleep(0.3)
+    if d.SelectSet.Count != 1:
+        return False
+    known = {h for h, _c, _t in U.window_rows(pid)}
+    _run_command(s, "FeaDeleteObjectCmd")
+    time.sleep(1.0)
+    for h, cls, _title in U.window_rows(pid):
+        if cls == "#32770" and h not in known and h != main:
+            for label in ("Yes", "OK"):
+                b = next((c for c in U.find_all(h, cls="Button") if c.text.replace("&", "") == label), None)
+                if b is not None:
+                    U.click(b)
+                    break
+    time.sleep(0.8)
+    return True
+
+
+@tool("analysis")
+def update_contacts(s: Session, study: str, delete_stale: bool = False) -> dict:
+    """After the geometry changed (parts added, moved or resized): mesh the study again from the current geometry,
+    then generate automatic contacts, and list them back per component. Automatic contacts use the last mesh, so
+    without the new mesh added parts get no contacts at all. With delete_stale, contacts between components that no
+    longer touch are deleted (each one is measured first and every deletion is listed). No mouse needed.
+
+    delete_stale: delete contacts whose two components are now apart (measured gap above 0.01 mm)
+    """
+    from .fea import _auto_contacts, update_mesh
+    pid = _pid(s)
+    _activate(s, study)
+    mesh_s = update_mesh(s, pid)
+    before = len(_contact_rows(s, study))
+    _auto_contacts(s, pid, mesh_first=False)
+    rep = _contacts_summary(s, study)
+    deleted = []
+    if delete_stale and rep.get("stale"):
+        for st in rep["stale"]:
+            hit = next((c for g, c in _contacts(s, study) if _label(c) == st["contact"]), None)
+            if hit is not None and _delete_node(s, pid, hit):
+                deleted.append(st)
+        rep = _contacts_summary(s, study)
+    out = {"study": study, "mesh_seconds": r(mesh_s, 1), "contacts_before": before, **rep}
+    if deleted:
+        out["deleted"] = deleted
+    if rep.get("no_contacts"):
+        out["warning"] = (f"{len(rep['no_contacts'])} component(s) have no contacts: {rep['no_contacts'][:8]}; they "
+                          "aren't attached to anything in this study")
+    return out
+
+
+# --------------------------------------------------------------------------- where the peak is
+RED = (255, 0, 0)
+
+
+def _reddish(rgb) -> bool:
+    """The top of Inventor's colour scale (pure red, darkened by shading)."""
+    r_, g, b = rgb
+    return r_ >= 140 and g <= 90 and b <= 90 and r_ - max(g, b) >= 100
+
+
+def red_cluster(pixels: list[tuple[int, int]], cell: int = 8) -> tuple[float, float, int] | None:
+    """(x, y, count) at the centre of the densest patch of top-colour pixels, or None."""
+    if not pixels:
+        return None
+    grid: dict = {}
+    for x, y in pixels:
+        grid.setdefault((x // cell, y // cell), []).append((x, y))
+    best = max(grid, key=lambda k: sum(len(grid.get((k[0] + i, k[1] + j), [])) for i in (-1, 0, 1) for j in (-1, 0, 1)))
+    pts = [p for i in (-1, 0, 1) for j in (-1, 0, 1) for p in grid.get((best[0] + i, best[1] + j), [])]
+    return sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts), len(pts)
+
+
+def _bmp_pixels(path: str, test) -> tuple[list[tuple[int, int]], int, int]:
+    import struct
+    with open(path, "rb") as f:
+        data = f.read()
+    off = struct.unpack_from("<I", data, 10)[0]
+    bw, bh = struct.unpack_from("<ii", data, 18)
+    bpp = struct.unpack_from("<H", data, 28)[0] // 8
+    row = (bw * bpp + 3) & ~3
+    out = []
+    h = abs(bh)
+    for yy in range(h):
+        base = off + (h - 1 - yy if bh > 0 else yy) * row
+        for x in range(bw):
+            i = base + x * bpp
+            if test((data[i + 2], data[i + 1], data[i])):
+                out.append((x, yy))
+    return out, bw, h
+
+
+def _unit(v):
+    n = sum(c * c for c in v) ** 0.5 or 1.0
+    return [c / n for c in v]
+
+
+def _hit_name(s: Session, ent) -> str:
+    occ = safe(lambda: ent.ContainingOccurrence.Name, "")
+    if occ:
+        key = safe(lambda: ent.NativeObject.TransientKey)
+        faces = safe(lambda: ent.ContainingOccurrence.Definition.SurfaceBodies.Item(1).Faces)
+        idx = next((i for i, f in enumerate(items(faces), 1) if safe(lambda f=f: f.TransientKey) == key), None) \
+            if faces is not None else None
+        return f"{occ}/{idx}" if idx else occ
+    key = safe(lambda: ent.TransientKey)
+    idx = next((i for i, f in enumerate(s.faces(), 1) if safe(lambda f=f: f.TransientKey) == key), None) \
+        if s.kind() == "part" else None
+    return f"face {idx}" if idx else "?"
+
+
+def peak_location(s: Session, views=("iso", "front", "top", "right", "back", "bottom", "left"),
+                  size=(480, 360)) -> dict:
+    """Where the shown result is highest: the view's top-colour patch is found in a render from several directions and
+    traced back onto the model along the line of sight. Approximate (to a few pixels of the render)."""
+    import tempfile
+
+    from .docs import VIEWS
+    v = s.view()
+    cam = v.Camera
+    keep = (cam.Eye, cam.Target, cam.UpVector, safe(lambda: cam.Perspective, False))
+    cd = s.doc().ComponentDefinition
+    path = os.path.join(tempfile.gettempdir(), "inventor_forge_peak.bmp")
+    seen = []
+    try:
+        for name in views:
+            cam.ViewOrientationType = getattr(K, VIEWS[name])
+            cam.Perspective = False
+            cam.Fit()
+            cam.ApplyWithoutTransition()
+            cam = v.Camera
+            v.SaveAsBitmap(path, int(size[0]), int(size[1]))
+            px, W, H = _bmp_pixels(path, _reddish)
+            spot = red_cluster(px)
+            if spot is None:
+                continue
+            from ..com import typed_call
+            ext = typed_call(cam, "GetExtents", 0.0, 0.0)
+            per_px = max(float(ext[-2]) / W, float(ext[-1]) / H)
+            e, t, u = cam.Eye, cam.Target, cam.UpVector
+            f = _unit([t.X - e.X, t.Y - e.Y, t.Z - e.Z])
+            up = _unit([u.X, u.Y, u.Z])
+            right = _unit([f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0]])
+            up = [right[1] * f[2] - right[2] * f[1], right[2] * f[0] - right[0] * f[2],
+                  right[0] * f[1] - right[1] * f[0]]
+            dx, dy = (spot[0] - W / 2) * per_px, (H / 2 - spot[1]) * per_px
+            q = [(t.X, t.Y, t.Z)[i] + dx * right[i] + dy * up[i] for i in range(3)]
+            origin = [q[i] - f[i] * 1000 for i in range(3)]
+            hit = safe(lambda: typed_call(cd, "FindUsingRay", s.tg.CreatePoint(*origin), s.tg.CreateUnitVector(*f),
+                                          per_px * 2, None, None, True))
+            ents, pts = (hit[-2], hit[-1]) if hit and len(hit) >= 2 else (None, None)
+            if ents is None or safe(lambda: ents.Count, 0) == 0:
+                continue
+            p = safe(lambda: pts.Item(1))
+            at = [r(p.X * 10, 1), r(p.Y * 10, 1), r(p.Z * 10, 1)] if p is not None else None
+            seen.append({"view": name, "pixels": spot[2], "near_mm": at, "on": _hit_name(s, ents.Item(1))})
+    finally:
+        safe(lambda: (setattr(cam, "Eye", keep[0]), setattr(cam, "Target", keep[1]), setattr(cam, "UpVector", keep[2]),
+                      setattr(cam, "Perspective", keep[3]), cam.ApplyWithoutTransition()))
+    if not seen:
+        return {"found": False, "note": "no top-colour area was visible from any direction (it may be inside, or the "
+                                        "colour scale's maximum is set by hand)"}
+    best = max(seen, key=lambda x: x["pixels"])
+    return {"found": True, "near_mm": best["near_mm"], "on": best["on"], "seen_from": [x["view"] for x in seen],
+            "note": "the highest values are around this point; a peak at a sharp corner, a point support or a "
+                    "contact edge is usually a singularity"}
+
+
+# --------------------------------------------------------------------------- after a solve
+def equilibrium(report: dict) -> dict:
+    """Applied forces against reactions from a parsed report. Only force loads given as vectors can be summed;
+    pressure, gravity and other loads make the check incomplete, which is said."""
+    applied = [0.0, 0.0, 0.0]
+    summed, skipped = 0, []
+    for ld in report.get("loads") or []:
+        vec = [_num_text(ld.get(k)) for k in ("vector_x", "vector_y", "vector_z")]
+        if "force" in str(ld.get("type", "")).lower() and all(v is not None for v in vec):
+            applied = [applied[i] + vec[i] for i in range(3)]
+            summed += 1
+        else:
+            skipped.append(str(ld.get("type", "?")))
+    reac = [0.0, 0.0, 0.0]
+    for rc in report.get("reactions") or []:
+        comp = rc.get("force_components_N") or []
+        reac = [reac[i] + ((comp[i] if i < len(comp) else 0.0) or 0.0) for i in range(3)]
+    mag = max(sum(v * v for v in applied) ** 0.5, 1e-9)
+    err = sum((reac[i] + applied[i]) ** 2 for i in range(3)) ** 0.5
+    out = {"applied_N": [r(v, 3) for v in applied], "reaction_N": [r(v, 3) for v in reac],
+           "forces_summed": summed}
+    if summed and report.get("reactions"):
+        out["error_pct"] = r(100 * err / mag, 2)
+        out["ok"] = not skipped and out["error_pct"] < 1.0
+    if skipped:
+        out["not_summed"] = skipped
+    return out
+
+
+def _num_text(text):
+    if text is None:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", str(text).replace(",", ""))
+    return float(m.group(0)) if m else None
+
+
+def solve_checks(report: dict, warnings: list[str] | None = None) -> list[str]:
+    """Plain-language problems found in a solved study's report."""
+    out = []
+    eq = equilibrium(report)
+    if eq.get("error_pct") is not None and eq["error_pct"] >= 1.0:
+        out.append(f"reactions don't balance the applied forces ({eq['error_pct']} % off): a load or support may "
+                   "be on the wrong faces, or a part isn't attached")
+    if not report.get("reactions"):
+        out.append("no reactions in the report: check the supports")
+    if warnings:
+        out.append(f"the solver reported {len(warnings)} warning(s): " + "; ".join(warnings[:3]))
+    return out
+
+
+def fast_outliers(rows: dict, ratio: float = 0.4) -> list[str]:
+    """Cases that solved much faster than the others (a sign that contacts were lost and the model came apart)."""
+    times = sorted(v.get("solve_seconds") for v in rows.values()
+                   if v.get("status") == "done" and v.get("solve_seconds"))
+    if len(times) < 3:
+        return []
+    median = times[len(times) // 2]
+    return [n for n, v in rows.items() if v.get("status") == "done" and v.get("solve_seconds")
+            and v["solve_seconds"] < ratio * median]
+
+
+# --------------------------------------------------------------------------- skipping unchanged solves
+def inputs_hash(parts: dict) -> str:
+    import hashlib
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _study_inputs(s: Session, study: str) -> dict:
+    d = s.doc()
+    params = {p.Name: safe(lambda p=p: p.Expression, "") for p in
+              items(safe(lambda: d.ComponentDefinition.Parameters) or [])}
+    tree = []
+    node = _study(s, study)
+    for folder in items(node.BrowserNodes):
+        if _label(folder) == "Results":
+            continue
+        tree.append(_label(folder))
+        for c in items(folder.BrowserNodes):
+            tree.append(" " + _label(c))
+            tree += ["  " + _label(x) for x in items(safe(lambda c=c: c.BrowserNodes) or [])]
+    return {"geometry": str(safe(lambda: d.ModelGeometryVersion, "")), "parameters": params, "study": tree}
+
+
+def _solve_log(s: Session) -> str:
+    from ..writes import output_path
+    stem = plain_name(os.path.splitext(os.path.basename(safe(lambda: s.doc().FullFileName, "") or "unsaved"))[0])
+    return output_path(s.workdir, f"{stem}_solves.json", "studies", ".json")
+
+
+def _has_results(s: Session, study: str) -> bool:
+    res = _child(_study(s, study), "Results")
+    return res is not None and safe(lambda: res.BrowserNodes.Count, 0) > 0
+
+
+# --------------------------------------------------------------------------- results on disk
+def results_folder(model_path: str) -> str:
+    """Where Stress Analysis keeps a model's meshes and results: <folder>\\<model name>\\AIP\\FEA."""
+    stem = os.path.splitext(os.path.basename(model_path))[0]
+    return os.path.join(os.path.dirname(model_path), stem, "AIP", "FEA")
+
+
+def storage(model_path: str) -> dict:
+    folder = results_folder(model_path)
+    total, meshes, results = 0, 0, 0
+    if os.path.isdir(folder):
+        for f in os.listdir(folder):
+            p = os.path.join(folder, f)
+            if os.path.isfile(p):
+                total += os.path.getsize(p)
+                meshes += f.lower().endswith(".fmsh")
+                results += f.lower().endswith(".fres")
+    return {"folder": folder, "gb": r(total / 2 ** 30, 3), "mesh_files": meshes, "result_files": results,
+            "gb_per_result": r(total / 2 ** 30 / results, 3) if results else None}
+
+
+@tool("analysis", mutates=False)
+def analysis_storage(s: Session) -> dict:
+    """How much disk the open model's Stress Analysis meshes and results take (kept beside the model until the studies
+    are deleted, and copied again with every Save As or file copy of the model), with the studies they belong to."""
+    path = safe(lambda: s.doc().FullFileName, "")
+    if not path:
+        raise InventorError("the document isn't saved yet, so it has no results on disk")
+    out = storage(path)
+    studies = safe(lambda: list(_study_nodes(s)), [])
+    out["studies"] = len(studies)
+    if studies:
+        out["solved"] = sum(1 for n in studies if safe(lambda n=n: _has_results(s, n), False))
+    return out
+
+
+@tool("analysis")
+def purge_studies(s: Session, keep: list[str], confirm: bool = False) -> dict:
+    """Delete every study not in keep, with its mesh and results, then save, to shrink a model before copying it or
+    to drop superseded load cases. Without confirm, only lists what would go. This can't be undone.
+
+    keep: study names to keep
+    confirm: really delete (after the user agreed to the list)
+    """
+    path = safe(lambda: s.doc().FullFileName, "")
+    names = list(_study_nodes(s))
+    unknown = [k for k in keep if k not in names]
+    if unknown:
+        raise InventorError(f"no studies {unknown}; this document has {names}")
+    drop = [n for n in names if n not in keep]
+    before = storage(path) if path else {}
+    if not confirm:
+        return {"would_delete": drop, "keep": keep, "results_gb_now": before.get("gb"),
+                "note": "nothing deleted; call again with confirm=true once the user agrees"}
+    pid = _pid(s)
+    done, failed = [], []
+    for n in drop:
+        try:
+            if n in _study_nodes(s) and _delete_node(s, pid, _study(s, n)) and n not in _study_nodes(s):
+                done.append(n)
+            else:
+                failed.append(n)
+        except InventorError as e:
+            failed.append(f"{n}: {e}")
+    saved = _save(s)
+    out = {"deleted": done, "kept": keep, "saved": saved, "results_gb_before": before.get("gb"),
+           "results_gb_after": storage(path).get("gb") if path else None}
+    if failed:
+        out["not_deleted"] = failed
+    return out

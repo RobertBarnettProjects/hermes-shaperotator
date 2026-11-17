@@ -89,6 +89,9 @@ class InventorBackend(CadBackend):
                                               timeout=float(s.get("timeout", 900))).start())
         if self._forge is None:
             from .forge.engine import Forge
+            logo = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "shaperotator-logo.png")
+            if os.path.exists(logo):                     # drawings carry the ShapeRotator mark in the title block
+                os.environ.setdefault("INVENTOR_FORGE_LOGO", os.path.abspath(logo))
             self._forge = Forge(visible=bool(self.settings.get("inventor_visible", True)))
             try:
                 from ...core.state import STATE

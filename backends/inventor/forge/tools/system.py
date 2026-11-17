@@ -312,6 +312,36 @@ def reload_api(s: Session) -> dict:
             "removed": sorted(before - set(TOOLS))}
 
 
+@tool("system", mutates=False, com=False)
+def set_output(s: Session, compact: bool = False, timings: bool = False) -> dict:
+    """How results come back for the rest of the session. compact: file paths that share a folder are given once
+    relative to it, and repeated notes are dropped. timings: each result says how long it waited for Inventor and how
+    long Inventor took.
+
+    compact: shorter results
+    timings: add queued_s / inventor_s to every result
+    """
+    s.compact, s.timings = bool(compact), bool(timings)
+    return {"compact": s.compact, "timings": s.timings}
+
+
+@tool("system", mutates=False, com=False)
+def guide(s: Session, topic: str = "") -> dict:
+    """Short reference notes on how Inventor behaves and the rules that keep work safe, one topic at a time: session
+    (working alongside the user, hangs, COM binding, unattended runs), modelling, assemblies, stress-analysis,
+    drawings, printing. With no topic, lists the topics. Read the relevant one before starting that kind of work.
+
+    topic: one of the listed topics
+    """
+    from .. import guides
+    if not topic:
+        return {"topics": guides.topics()}
+    try:
+        return {"topic": topic, "text": guides.read(topic)}
+    except KeyError:
+        raise InventorError(f"no guide {topic!r}; topics: {', '.join(guides.topics())}") from None
+
+
 @tool("system", mutates=False)
 def list_tools(s: Session, group: str = "") -> dict:
     """Tool names by group (session, documents, sketch, features, inspect, parameters, materials,

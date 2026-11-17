@@ -78,7 +78,8 @@ def _parse_doc(doc: str) -> tuple[str, dict[str, str]]:
 # tools whose effect can't be undone from inside Inventor, or that throw work away (MCP destructiveHint)
 DESTRUCTIVE = {"close_document", "close_private_inventor", "delete_study_item", "delete_feature", "save_document",
                "export_document", "export_pdf", "execute_python", "answer_dialog", "set_active_project", "undo",
-               "run_study_cases", "bill_of_materials", "flat_pattern"}
+               "run_study_cases", "bill_of_materials", "flat_pattern", "purge_studies",
+               "copy_assembly"}
 
 
 def tool(group: str, name: str | None = None, mutates: bool = True, com: bool = True):
@@ -108,5 +109,6 @@ def tool(group: str, name: str | None = None, mutates: bool = True, com: bool = 
 
 
 def load_all() -> dict[str, Tool]:
-    from .tools import assembly, docs, drawing, features, fea, inspect as _inspect, parametric, sheetmetal, sketch, standard, studies, system  # noqa: F401
+    from .tools import (assembly, build, docs, drawing, features, fea, inspect as _inspect, parametric,  # noqa: F401
+                        printing, sheetmetal, sketch, standard, studies, system)
     return TOOLS
