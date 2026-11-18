@@ -184,6 +184,7 @@ def create_drawing(s: Session, standard: str = "", sheet_size: str = "A3", orien
                     for attr2 in ("DiameterExternalTextOrientation", "DiameterInternalTextOrientation",
                                   "RadialTextOrientation"):
                         safe(lambda ds=ds, a2=attr2: setattr(ds, a2, K.kInlineHorizontalDimensionText))
+        safe(lambda: _plain_label_defaults(std))
     sh = d.ActiveSheet
     _resize(sh, sheet_size, orientation)
     _set_custom(d, STANDARD_PROP, k)
@@ -199,6 +200,36 @@ def create_drawing(s: Session, standard: str = "", sheet_size: str = "A3", orien
 
 
 STANDARD_PROP = "Drafting standard"
+
+
+_ZONE_REF = re.compile(r"\s*/\s*<DrawingView(Parent)?Sheet(Name|Index|Zone)/>.*$")
+
+
+def _plain_label(text: str) -> str:
+    """A view label's format without the parent sheet/zone reference ("A-A ( 1 : 2 ) / .C4" -> "A-A ( 1 : 2 )"),
+    which only means something on multi-sheet sets and reads as clutter on a single sheet."""
+    return _ZONE_REF.sub("", text or "")
+
+
+def _plain_label_defaults(std) -> None:
+    """Section, detail and other view labels: no zone reference, placed below the view."""
+    from ..com import typed_call
+    for vt in ("kSectionDrawingViewType", "kDetailDrawingViewType", "kAuxiliaryDrawingViewType",
+               "kProjectedDrawingViewType", "kStandardDrawingViewType"):
+        code = K.get(vt)
+        if code is None:
+            continue
+        got = safe(lambda c=code: typed_call(std, "GetViewLabelDefaults", c, "", False, "", False, False))
+        if not got or len(got) < 5:
+            continue
+        prefix, visible, text, constrain = got[-5], got[-4], got[-3], got[-2]
+        safe(lambda c=code, p=prefix, v=visible, t=text, cb=constrain:
+             std.SetViewLabelDefaults(c, p, v, _plain_label(t), cb, True))
+        # the identifier on the cutting line or detail fence ("A / .A6") has its own format
+        ann = safe(lambda c=code: typed_call(std, "GetViewAnnotationDefaults", c, ""))
+        txt = ann[-1] if isinstance(ann, (tuple, list)) and ann else ann
+        if isinstance(txt, str) and _plain_label(txt) != txt:
+            safe(lambda c=code, t=txt: std.SetViewAnnotationDefaults(c, _plain_label(t)))
 
 
 def _set_custom(d, name: str, value: str) -> None:
@@ -1039,6 +1070,9 @@ def place_view_labels(s: Session) -> dict:
         if v.Name.upper().startswith("VIEW") and o in names:
             safe(lambda v=v: setattr(v, "Name", names[o] + ("" if names[o] not in [x["name"] for x in out] else " 2")))
         v.ShowLabel = True
+        ft = safe(lambda v=v: v.Label.FormattedText, "")
+        if ft and _plain_label(ft) != ft:              # drawings made before the defaults were set
+            safe(lambda v=v, ft=ft: setattr(v.Label, "FormattedText", _plain_label(ft)))
         b = _box(v)
         mid = (b[0] + b[2]) / 2
         y = b[1] - LABEL_DROP
@@ -1472,9 +1506,10 @@ def _annotation_obstacles(sh) -> list:
 
 
 def _place_note(s: Session, sh, make, anchor_cm, view_box, level: float = 0.0, with_score: bool = False):
-    """Create a note with `make(point)` at the best of a ring of candidate spots around its anchor; keeps the first spot
-    if it is already clear. Leader notes ignore later moves, so each candidate is a fresh note."""
-    best = None
+    """Create a note with `make(point)` at the best of a ring of candidate spots around its anchor. The note is made
+    once at the usual spot and measured; every other spot is scored from that measured size without creating
+    anything, and the note is remade only if another spot is better (so at most two notes are ever created, and no
+    trial notes flash up on the sheet). Leader notes ignore later moves, hence the remake."""
     ax, ay = anchor_cm[0] * 10, anchor_cm[1] * 10
     cand = [(view_box[2] + 14, ay)]
     for dist in (14, 24, 36):
@@ -1482,28 +1517,42 @@ def _place_note(s: Session, sh, make, anchor_cm, view_box, level: float = 0.0, w
             ang = math.radians(k * 22.5)
             cand.append((ax + math.cos(ang) * (dist + (view_box[2] - view_box[0]) / 2 * abs(math.cos(ang))),
                          ay + math.sin(ang) * (dist + (view_box[3] - view_box[1]) / 2 * abs(math.sin(ang)))))
-    for i, (x, y) in enumerate(cand):
-        note = safe(lambda: make(s.tg.CreatePoint2d(x * MM, y * MM)))
-        if note is None:
-            continue
-        rb = safe(lambda: note.Text.RangeBox)
-        if rb is None:
-            return note
-        clash = _note_score(sh, _mm_box(rb), own=note)
+    x0, y0 = cand[0]
+    note = safe(lambda: make(s.tg.CreatePoint2d(x0 * MM, y0 * MM)))
+    if note is None:
+        return (None, None) if with_score else None
+    rb = safe(lambda: note.Text.RangeBox)
+    if rb is None:
+        return (note, 0.0) if with_score else note
+    b0 = _mm_box(rb)
+    w, h = b0[2] - b0[0], b0[3] - b0[1]
+    lift = (b0[1] + b0[3]) / 2 - y0                     # text centre above the leader's end
+
+    def predicted(x, y):
+        """Where the text lands for a leader ending at (x, y): level, running away from the anchor."""
+        cy = y + lift
+        return (x, cy - h / 2, x + w, cy + h / 2) if x >= ax else (x - w, cy - h / 2, x, cy + h / 2)
+
+    def score(x, y, box):
+        clash = _note_score(sh, box, own=note)
         sc = clash + math.hypot(x - ax, y - ay) * 0.06
         if level:            # hole notes' text runs along the leader: among clear spots, prefer a level leader
             sc += level * abs(y - ay) / max(math.hypot(x - ax, y - ay), 1e-6) if clash < 5 else 1000
-        if best is None or sc < best[0]:
-            if best is not None:
-                safe(lambda b=best[1]: b.Delete())
-            best = (sc, note, (x, y))
-        else:
+        return sc
+
+    first = score(x0, y0, b0)
+    best = (first, x0, y0)
+    if first >= 5:                                     # the usual spot isn't clear: look at the others on paper
+        for x, y in cand[1:]:
+            sc = score(x, y, predicted(x, y))
+            if sc < best[0]:
+                best = (sc, x, y)
+    if (best[1], best[2]) != (x0, y0):
+        moved = safe(lambda: make(s.tg.CreatePoint2d(best[1] * MM, best[2] * MM)))
+        if moved is not None:
             safe(lambda: note.Delete())
-        if i == 0 and sc < 5:                        # the usual spot is clear
-            break
-    if with_score:
-        return (best[1], best[0]) if best else (None, None)
-    return best[1] if best else None
+            note = moved
+    return (note, best[0]) if with_score else note
 
 
 def _is_boss_face(f) -> bool:
