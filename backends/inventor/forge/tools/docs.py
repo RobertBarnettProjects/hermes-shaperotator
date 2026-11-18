@@ -665,11 +665,18 @@ def export_document(s: Session, path: str, format: str = "") -> dict:
 
 
 @tool("view")
-def set_view(s: Session, view: str = "iso", fit: bool = True) -> dict:
-    """Orient the active 3D view: iso, iso_left, iso_bottom, front, back, top, bottom, left, right, home."""
+def set_view(s: Session, view: str = "iso", fit: bool = True, up: str = "y") -> dict:
+    """Orient the active 3D view: iso, iso_left, iso_bottom, front, back, top, bottom, left, right, home.
+
+    up: "y" (Inventor's named views) or "z" for models built Z-up (vehicles, frames, anything laid out on the XY
+        ground plane): the view then has Z pointing up the screen, so the model isn't seen lying on its side
+    """
     v = s.view()
     if v is None:
         raise InventorError("no active view")
+    if (up or "y").strip().lower() == "z":
+        _aim_z_up(s, view.strip().lower())
+        return {"view": view, "up": "z"}
     cam = v.Camera
     key = VIEWS.get(view.lower())
     if not key:
