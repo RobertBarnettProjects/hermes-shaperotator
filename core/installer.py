@@ -167,7 +167,13 @@ def _source(name: str, srv: dict) -> tuple[str, str]:
                            f"server_sources.{name} in the plugin settings to a local checkout")
     if shutil.which("git"):
         return f"{srv['package']} @ git+{srv['repo']}@{commit}", f"{srv['repo']} at commit {commit[:10]}"
-    return f"{srv['package']} @ {srv['repo']}/archive/{commit}.zip", f"{srv['repo']} at commit {commit[:10]}"
+    digest = str(srv.get("archive_sha256") or "")
+    if len(digest) != 64:
+        raise InstallError(f"{name}: installing {srv['package']} needs git (https://git-scm.com), or an archive "
+                           f"checksum in this plugin release")
+    # without git, GitHub's archive of the same commit; pip refuses it unless its sha256 matches the pinned one
+    return (f"{srv['package']} @ {srv['repo']}/archive/{commit}.zip#sha256={digest}",
+            f"{srv['repo']} at commit {commit[:10]} (archive, sha256 checked)")
 
 
 def server_status(name: str) -> dict:
@@ -336,4 +342,5 @@ def setup_question(found: dict[str, dict] | None = None) -> str:
         parts.append(f"{v.get('version') or v['title']} [{k}: {state}]")
     return ("CAD program not chosen yet. Found on this computer: " + "; ".join(parts) + ". Ask the user once which "
             "to use (the clarify tool if you have it). Then call cad_backend(action='use', backend=<name>); for one "
-            "that needs its add-on, call cad_backend(action='install', backend=<name>) first. The choice is kept.")
+            "that needs its add-on, call cad_backend(action='install', backend=<name>) first (if its approval is "
+            "refused or can't be shown, tell the user and stop; never install it another way). The choice is kept.")

@@ -27,7 +27,8 @@ CAD_BACKEND = _tool(
     "cad_backend",
     "Choose the CAD program every cad_* tool drives. action='list': the CAD programs found on this computer and "
     "whether each is ready. action='install': download the add-on a CAD program needs (Inventor needs "
-    "inventor-forge, a one-time download into its own environment; the user approves it in a prompt). "
+    "inventor-forge, a one-time download into its own environment; the user approves it in a prompt. If the prompt "
+    "is refused or can't be shown, tell the user; never install it another way). "
     "action='use' (default): switch to it and remember the choice. 'freecad' = headless FreeCAD (cross-platform). "
     "'inventor' = Autodesk Inventor (Windows, opens the Inventor window). Only switch when the user asks or the "
     "current backend lacks a feature. Any other name is a CAD MCP server configured under mcp_servers - plans, "

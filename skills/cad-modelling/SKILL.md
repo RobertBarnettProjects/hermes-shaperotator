@@ -23,7 +23,9 @@ series you suggest (e.g. AS/NZS 3678 Grade 350 for AS, S355 for ISO/DIN, ASTM A3
 1. `cad_status` — which backend is active and available, and where job files go. If it returns `setup.ask`, no CAD
    program has been chosen yet: ask the user that question once, then `cad_backend(action='use', backend=...)`. A
    program that needs its add-on (Inventor needs inventor-forge) gets `cad_backend(action='install', backend=...)`
-   first; tell the user it is a one-time download they approve.
+   first; tell the user it is a one-time download they approve. If the approval is refused, or can't be shown (a
+   single-query or unattended run), stop and tell the user: never install the add-on another way (pip, copying
+   files, writing its install record).
 2. `cad_document(action="new_part", name=...)` (or `open`).
 3. One feature per call. Every `cad_feature` returns a **delta** (volume and face count before → after).
    Check it against a hand calculation before the next step:

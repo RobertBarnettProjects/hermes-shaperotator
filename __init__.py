@@ -82,8 +82,30 @@ def _native_executes_code(args: Any) -> bool:
 NL = chr(10)
 
 
+def _add_on_folder_touched(args: Any) -> str:
+    """The add-on folder, when another tool's arguments name it ("" otherwise). Add-ons get there only through
+    cad_backend(action='install') and the approval prompt it shows, never by hand."""
+    try:
+        from .core import installer
+        root = str(installer._data_dir() / "servers").replace("\\", "/").lower().rstrip("/")
+        text = json.dumps(args, default=str).replace("\\\\", "/").replace("\\", "/").lower()
+    except Exception:  # noqa: BLE001
+        return ""
+    forms = {root}
+    if len(root) > 2 and root[1] == ":":
+        forms.add(f"/{root[0]}{root[2:]}")                     # /c/users/... as POSIX shells write it
+    return root if any(f in text for f in forms) else ""
+
+
 def _pre_tool_call(tool_name: str = "", args: Any = None, **kw: Any):
     if not str(tool_name).startswith("cad_"):
+        folder = _add_on_folder_touched(args)
+        if folder:
+            return {"action": "block",
+                    "message": f"hermes-shaperotator: {folder} holds the CAD add-ons, which are installed only by "
+                               "cad_backend(action='install') after the user approves its prompt. If that was "
+                               "refused or nobody could answer it, tell the user; don't install or change it another "
+                               "way."}
         return None
     from .core.paths import outside_writes
     from .core.workbench import LIVE

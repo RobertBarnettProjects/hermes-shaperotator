@@ -213,11 +213,15 @@ def test_unpinned_release_refuses_to_guess(data, monkeypatch):
 def test_pinned_commit_is_installed_from_its_repository(data, monkeypatch):
     sha = "a" * 40
     monkeypatch.setitem(STATE.settings, "server_sources", {})
-    monkeypatch.setattr(installer, "known", lambda: {"inventor": {"title": "Autodesk Inventor", "server": {
-        "package": "inventor-forge", "repo": "https://github.com/o/r", "commit": sha}}})
+    table = {"inventor": {"title": "Autodesk Inventor", "server": {
+        "package": "inventor-forge", "repo": "https://github.com/o/r", "commit": sha}}}
+    monkeypatch.setattr(installer, "known", lambda: table)
     monkeypatch.setattr(installer.shutil, "which", lambda exe: None)
+    with pytest.raises(installer.InstallError, match="needs git"):      # an archive nobody can check: refused
+        installer._source("inventor", installer.entry("inventor")["server"])
+    table["inventor"]["server"]["archive_sha256"] = "b" * 64
     req, what = installer._source("inventor", installer.entry("inventor")["server"])
-    assert req == f"inventor-forge @ https://github.com/o/r/archive/{sha}.zip" and sha[:10] in what
+    assert req == f"inventor-forge @ https://github.com/o/r/archive/{sha}.zip#sha256={'b' * 64}" and sha[:10] in what
     monkeypatch.setattr(installer.shutil, "which", lambda exe: "git")
     assert installer._source("inventor", installer.entry("inventor")["server"])[0].endswith(f"r@{sha}")
 
@@ -286,3 +290,16 @@ def test_status_never_starts_a_cad_program(data, monkeypatch):
     monkeypatch.setattr(STATE, "backend_chosen", STATE.backend_name)
     out = json.loads(T.HANDLERS["cad_status"]({}))
     assert out["ok"] and out["document"] is None and not started
+
+
+def test_add_on_folder_is_only_reached_through_the_approved_install(data):
+    root = data / "servers" / "inventor"
+    win = str(root)
+    posix = "/" + win[0].lower() + win[2:].replace("\\", "/")
+    for tool, args in [("terminal", {"command": f"python -m venv '{posix}/venv-x'"}),
+                       ("write_file", {"path": win + "\\installed.json", "content": "{}"}),
+                       ("terminal", {"command": f"pip install --target {win.upper()}"})]:
+        d = P._pre_tool_call(tool_name=tool, args=args)
+        assert d and d["action"] == "block" and "cad_backend(action='install')" in d["message"], (tool, args)
+    assert P._pre_tool_call(tool_name="terminal", args={"command": "dir C:\\Users"}) is None
+    assert P._pre_tool_call(tool_name="read_file", args={"path": str(data / "jobs" / "a.step")}) is None

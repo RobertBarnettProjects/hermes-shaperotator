@@ -152,9 +152,9 @@ reported when an analysis computed one. The footer is append-only, so streaming 
 
 | Hook | Behaviour |
 |---|---|
-| `pre_tool_call` | asks for approval before `cad_python`; blocks drawing PDF export until QA is clean |
+| `pre_tool_call` | asks for approval before `cad_python`, before downloading a CAD program's add-on, before a server tool that deletes, runs code, takes over the mouse and keyboard or writes outside the job folder, and before a server tool that doesn't describe itself; blocks drawing PDF export until QA is clean |
 | `post_tool_call` | after a geometry change, publishes the model to the Desktop pane (limited to about a fifth of build time; catches up at the end of the reply) |
-| `pre_llm_call` | one line of CAD state (backend, last delta, QA status) so the model keeps its bearings |
+| `pre_llm_call` | one line of CAD state (backend, last delta, QA status) so the model keeps its bearings; until a CAD program is chosen, asks the model to offer you the ones found on this computer |
 | `transform_llm_output` | appends the verification footer when a reply quotes engineering figures |
 | `on_session_finalize` | closes worker processes |
 
@@ -168,7 +168,14 @@ reported when an analysis computed one. The footer is append-only, so streaming 
 - **Downloads (opt-in, once per program):** `cad_backend(action='install')` downloads a CAD program's add-on server
   (inventor-forge from its GitHub repository at the commit pinned in `backends/known.json`, plus pywin32 from PyPI)
   and installs it with pip into its own environment under the plugin data folder. Always through Hermes's approval
-  prompt, which names what is downloaded and where it goes.
+  prompt, which names what is downloaded and where it goes (refused when nobody answers). The pinned commit only
+  changes with a new release of this plugin; nothing updates itself. Without git, GitHub's archive of the same commit
+  is used, and pip refuses it unless its sha256 matches the one in `known.json`. pip runs isolated from your pip
+  configuration; only proxy and certificate settings are passed to it. The `server_sources` setting installs from a
+  source you name instead (a local checkout, for example).
+- **Background process:** once installed and in use, the add-on runs as a child process (an MCP server over stdio)
+  until the session ends or you switch CAD program. It drives Inventor through COM and, while a long call runs,
+  sends a progress message every 10 seconds.
 - **Takes over the mouse and keyboard (opt-in per call):** `cad_native analyze_stress / analyze_modes` drive
   Inventor's Stress Analysis (which has no API) by clicking faces in Inventor's viewport and typing into its
   dialogs for about half a minute. Each call goes through Hermes's approval prompt (refused when nobody

@@ -3,15 +3,23 @@
   "freecad": {
     "title": "FreeCAD",
     "builtin": true,
-    "detect": {"builtin": "freecad"}
+    "detect": {
+      "builtin": "freecad"
+    }
   },
   "inventor": {
     "title": "Autodesk Inventor",
     "family": "inventor",
-    "platforms": ["win32"],
+    "platforms": [
+      "win32"
+    ],
     "detect": {
       "com_class": "Inventor.Application",
-      "registry": {"key": "SOFTWARE\\Autodesk\\Inventor", "subkeys": "RegistryVersion", "value": "Location"}
+      "registry": {
+        "key": "SOFTWARE\\Autodesk\\Inventor",
+        "subkeys": "RegistryVersion",
+        "value": "Location"
+      }
     },
     "server": {
       "package": "inventor-forge",
@@ -19,10 +27,14 @@
       "version": "0.2.0",
       "licence": "MIT",
       "repo": "https://github.com/RobertBarnettProjects/inventor-forge",
-      "commit": "PENDING",
+      "commit": "6c2dd34be9553462e141863a84fde2549b38f524",
       "also_installs": "pywin32 (from PyPI)",
       "size_mb": 25,
-      "env": {"INVENTOR_FORGE_WORKDIR": "{job_dir}", "INVENTOR_FORGE_LOGO": "{logo}"}
+      "env": {
+        "INVENTOR_FORGE_WORKDIR": "{job_dir}",
+        "INVENTOR_FORGE_LOGO": "{logo}"
+      },
+      "archive_sha256": "85505dc8e660c70712bdaae7f33201f625aa713d6738485dc8f7082ae6458609"
     }
   }
 }
