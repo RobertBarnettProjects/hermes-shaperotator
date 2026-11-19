@@ -1,22 +1,17 @@
 """The drafting/engineering standard each chat works to. The agent asks the user once at the start of a CAD chat;
 the choice is kept per Hermes session (on disk, so it survives a restart) and every drawing follows it.
 
-The table itself is inventor-forge's (`standards.py`, vendored), loaded on its own so FreeCAD-only installs don't
-need pywin32.
+The table (standards_table.py) is the same one inventor-forge uses, kept here so FreeCAD-only installs need nothing
+else.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import threading
 from pathlib import Path
 
+from . import standards_table as T
 from .state import STATE, _data_dir
-
-_SRC = Path(__file__).resolve().parent.parent / "backends" / "inventor" / "forge" / "standards.py"
-_spec = importlib.util.spec_from_file_location("hermes_shaperotator_standards", _SRC)
-T = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(T)              # type: ignore[union-attr]
 
 StandardError = T.StandardError
 _LOCK = threading.Lock()

@@ -95,24 +95,54 @@ def cad_status(args: dict, **_: Any) -> str:
         except BackendError as e:
             doc = {"error": str(e)}
     from . import standard as _std
+    from . import installer, server_profile
     std = _std.chosen()
-    return _ok(backends=avail, document=doc, last_delta=STATE.last_delta or None,
+    setup = {"chosen": STATE.backend_chosen, "found": installer.detect_all()}
+    if not STATE.backend_chosen:
+        setup["ask"] = installer.setup_question(setup["found"])
+    return _ok(backends=avail, setup=setup, server=server_profile.summary() or None, document=doc,
+               last_delta=STATE.last_delta or None,
                standard=std or {"chosen": False, "ask": _std.ASK},
                job_folder=str(STATE.jobs()), drawing_qa={"dirty": STATE.qa.dirty, "issues": STATE.qa.last_issues})
 
 
 @safe
 def cad_backend(args: dict, **_: Any) -> str:
-    name = args["backend"].lower()
+    from . import installer
+    action = (args.get("action") or "use").lower()
+    if action == "list":
+        found = installer.detect_all()
+        return _ok(found=found, chosen=STATE.backend_chosen,
+                   **({} if STATE.backend_chosen else {"ask": installer.setup_question(found)}))
+    name = str(args.get("backend") or "").lower()
+    if not name:
+        return _err("backend is required (cad_backend(action='list') shows the choices)")
+    if action == "install":
+        if name not in installer.known():
+            return _err(f"{name} has nothing to install (known: {', '.join(installer.known())})")
+        found = installer.detect(name)
+        if not found.get("found"):
+            return _err(f"{found.get('detail')}: install the CAD program itself first")
+        try:
+            res = installer.install(name)    # the user approved the download in the pre_tool_call prompt
+        except (installer.InstallError, OSError, Exception) as e:  # noqa: BLE001
+            return _err(f"install failed: {e}")
+        return _ok(message=f"{name} add-on installed; next: cad_backend(action='use', backend='{name}')", **res)
+    if action != "use":
+        return _err(f"unknown action {action} (use, install, list)")
+    if name not in BACKENDS:
+        return _err(f"unknown backend {name!r} (choose {', '.join(BACKENDS)})")
     b = STATE.backend(name)
     ok, why = b.available()
     if not ok:
         return _err(why)
     res = b.call("connect")              # only switch once it actually connected
     STATE.backend_name = name
+    STATE.backend_chosen = name
+    installer.remember(name)
     STATE.last_delta = ""
     STATE.qa.dirty, STATE.qa.last_issues = True, None
-    return _ok(message=f"backend is now {name}", detail=res)
+    return _ok(message=f"backend is now {name} (remembered for later chats)", detail=res)
 
 
 @safe
@@ -561,10 +591,11 @@ def cad_native(args: dict, **_: Any) -> str:
     if tool == "export_document" and (str(targs.get("format", "")).upper() == "PDF"
                                       or str(targs.get("path", "")).lower().endswith(".pdf")):
         return _err("PDF export: use cad_drawing(action='export_pdf') so the QA gate applies")
-    if tool in ("analyze_stress", "analyze_modes", "result_at_point") or (tool == "study_report" and targs.get("only_this_study")):
+    from . import server_profile
+    if server_profile.takes_input(tool, targs):
         # the pre_tool_call hook showed the mouse/keyboard notice in Hermes's approval prompt and the user approved
         targs["user_notified"] = True
-    for key in _paths.NATIVE_NAMES.get(tool, ()):
+    for key in (server_profile.files(tool) or {}).get("names", ()):
         if isinstance(targs.get(key), str) and targs[key]:
             targs[key] = _paths.safe_name(targs[key])        # these become file names inside Inventor's workdir
     for key, value in _paths.written_args("cad_native", {"tool": tool, "args": targs}):

@@ -64,6 +64,7 @@ class DrawingQA:
 class State:
     settings: dict[str, Any] = field(default_factory=dict)
     backend_name: str = "freecad"
+    backend_chosen: str = ""        # set by the user (plugin settings, or cad_backend use); "" = ask them first
     backends: dict[str, CadBackend] = field(default_factory=dict)
     qa: DrawingQA = field(default_factory=DrawingQA)
     job_dir: Path | None = None

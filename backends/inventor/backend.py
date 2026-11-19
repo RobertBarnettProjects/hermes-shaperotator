@@ -1,14 +1,16 @@
-"""Autodesk Inventor backend (Windows only, COM) built on inventor-forge (vendored in ./forge).
+"""Autodesk Inventor backend (Windows only, COM) over inventor-forge, this project's Inventor MCP server.
 
-inventor-forge is this project's own Inventor automation layer — it also runs on its
-own as an MCP server (see the inventor-forge repository). This adapter maps hermes-shaperotator's
-backend-neutral ops onto forge tools, and exposes every other forge tool through the ``native`` op
-(``cad_native`` in Hermes): sheet metal, assemblies, materials, mass properties, drawings, Inventor-side
-stress/modal analysis...
+inventor-forge runs as its own process, from its own Python environment: installed on first use when the user
+approves (``cad_backend(action="install", backend="inventor")``, see core/installer.py), or any command configured
+under ``mcp_servers`` with ``dialect: inventor-forge``. This adapter maps hermes-shaperotator's backend-neutral ops
+onto forge tools, and exposes every other forge tool through the ``native`` op (``cad_native`` in Hermes): sheet
+metal, assemblies, materials, mass properties, drawings, Inventor-side stress/modal analysis...
+
+Nothing of forge is imported here: what the plugin needs to know about each tool (geometry changes, mouse use, file
+arguments, how long to wait) comes from the server's own cad profile (core/server_profile.py).
 """
 from __future__ import annotations
 
-import os
 import sys
 from typing import Any
 
@@ -16,7 +18,7 @@ from ...core.backend import BackendError, CadBackend
 
 
 class _McpForge:
-    """inventor-forge reached over MCP instead of in-process: same tool names, same results."""
+    """inventor-forge over MCP: the client plus forge's connect / re-sync rules."""
 
     def __init__(self, client):
         self.client = client
@@ -26,17 +28,14 @@ class _McpForge:
         return self.client.tools
 
     def call(self, name: str, args: dict) -> dict:
-        from .forge.registry import load_all
-        spec = load_all().get(name)
+        from ...core import server_profile
+        self.client.start()                       # before the budget: it comes from the server's tool list
         if name == "connect":
-            self.client.start()
             self.client.wait_for_pending_calls()
-        wait = None
-        if spec is not None:
-            from .forge.engine import call_budget
-            wait = max(self.client.timeout, call_budget(spec.fn, args, self.client.timeout))
-        result = self.client.call(name, args, mutating=False if name == "connect" else (spec.mutates if spec else None),
-                                  timeout=wait)
+        wait = server_profile.budget(name, args, self.client.timeout)
+        meta = self.client.tools.get(name) or {}
+        mutating = False if name == "connect" else not (meta.get("annotations") or {}).get("readOnlyHint", False)
+        result = self.client.call(name, args, mutating=mutating, timeout=wait)
         if name == "connect":
             self.client.call("status", {}, mutating=False)
             self.client.uncertain = False
@@ -63,62 +62,75 @@ class InventorBackend(CadBackend):
 
     def __init__(self, settings: dict[str, Any], server: dict | None = None):
         super().__init__(settings)
-        self._forge = None
-        self.server = server          # None = vendored forge in-process; else an MCP server config
+        self._forge: _McpForge | None = None
+        self.server = server          # an mcp_servers entry; None = the add-on installed by core/installer.py
 
     def available(self) -> tuple[bool, str]:
         if sys.platform != "win32":
             return False, "Autodesk Inventor runs on Windows only"
+        from ...core import installer
+        found = installer.detect("inventor")
+        if not found.get("found"):
+            return False, found.get("detail") or "Autodesk Inventor is not installed"
+        if self.server:
+            return True, f"{found.get('version')}, inventor-forge from mcp_servers ({' '.join(self.server['command'])})"
+        st = installer.server_status("inventor")
+        if not st["installed"]:
+            return False, f"{found.get('version')} found; {st['detail']}"
+        return True, f"{found.get('version')}, inventor-forge {st.get('version')}" + (
+            "" if st.get("current") else f" ({st['detail']})")
+
+    def _config(self) -> dict:
+        if self.server:
+            return self.server
+        from ...core import installer
+        from ...core.state import STATE
         try:
-            import winreg
-            winreg.CloseKey(winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "Inventor.Application"))
-        except OSError:
-            return False, "Autodesk Inventor is not installed (no Inventor.Application COM class)"
-        try:
-            import win32com  # noqa: F401
-        except ImportError:
-            return False, "pywin32 is not installed in Hermes's Python (pip install pywin32)"
-        return True, "Inventor COM class registered"
+            return installer.server_config("inventor", {"job_dir": str(STATE.jobs())})
+        except installer.InstallError as e:
+            raise BackendError(str(e)) from e
+
+    def mcp_client(self, start: bool = False):
+        """The forge client (created, and started when asked); None when forge isn't installed."""
+        if self._forge is None:
+            if not start:
+                return None
+            from ...core.mcp_client import McpClient
+            s = self._config()
+            env = dict(s.get("env") or {})
+            env.setdefault("INVENTOR_FORGE_VISIBLE", "1" if self.settings.get("inventor_visible", True) else "0")
+            client = McpClient(s["command"], env=env, cwd=s.get("cwd"), timeout=float(s.get("timeout", 900)))
+            self._forge = _McpForge(client)
+        return self._forge.client
 
     @property
-    def forge(self):
-        if self._forge is None and self.server:
-            from ...core.mcp_client import McpClient
-            s = self.server
-            self._forge = _McpForge(McpClient(s["command"], env=s.get("env"), cwd=s.get("cwd"),
-                                              timeout=float(s.get("timeout", 900))).start())
-        if self._forge is None:
-            from .forge.engine import Forge
-            logo = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "shaperotator-logo.png")
-            if os.path.exists(logo):                     # drawings carry the ShapeRotator mark in the title block
-                os.environ.setdefault("INVENTOR_FORGE_LOGO", os.path.abspath(logo))
-            self._forge = Forge(visible=bool(self.settings.get("inventor_visible", True)))
-            try:
-                from ...core.state import STATE
-                self._forge.session.workdir = str(STATE.jobs())    # pictures, reports, case files: the job folder
-            except Exception:
-                pass
+    def forge(self) -> _McpForge:
+        self.mcp_client(start=True)
+        assert self._forge is not None
         return self._forge
+
+    @property
+    def client(self):
+        """The started client, if any (hooks ask without starting a server)."""
+        return self._forge.client if self._forge is not None else None
 
     def tool_names(self) -> list[str]:
         return sorted(self.forge.tools)
 
     def _f(self, tool: str, **args: Any) -> dict:
         from ...core.mcp_client import McpError
-        from .forge.com import InventorError
         try:
             return self.forge.call(tool, {k: v for k, v in args.items() if v is not None})
-        except (InventorError, McpError) as e:
+        except McpError as e:
             raise BackendError(str(e)) from e
+        except BackendError:
+            raise
         except Exception as e:  # noqa: BLE001
             raise BackendError(f"Inventor {tool} failed: {type(e).__name__}: {e}") from e
 
     def shutdown(self) -> None:
         if self._forge is not None:
-            if isinstance(self._forge, _McpForge):
-                self._forge.close()
-            else:
-                self._forge.apartment.close()
+            self._forge.close()
             self._forge = None
 
     # ------------------------------------------------------------------ op table

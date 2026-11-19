@@ -1,0 +1,28 @@
+{
+  "_about": "CAD programs this plugin knows how to drive. 'builtin' backends ship with the plugin; the others are separate MCP servers, downloaded only when the user approves (pinned to one commit, installed into their own Python environment under the plugin's data folder). scripts/pin_backend.py updates a pin.",
+  "freecad": {
+    "title": "FreeCAD",
+    "builtin": true,
+    "detect": {"builtin": "freecad"}
+  },
+  "inventor": {
+    "title": "Autodesk Inventor",
+    "family": "inventor",
+    "platforms": ["win32"],
+    "detect": {
+      "com_class": "Inventor.Application",
+      "registry": {"key": "SOFTWARE\\Autodesk\\Inventor", "subkeys": "RegistryVersion", "value": "Location"}
+    },
+    "server": {
+      "package": "inventor-forge",
+      "module": "inventor_forge.server",
+      "version": "0.2.0",
+      "licence": "MIT",
+      "repo": "https://github.com/RobertBarnettProjects/inventor-forge",
+      "commit": "PENDING",
+      "also_installs": "pywin32 (from PyPI)",
+      "size_mb": 25,
+      "env": {"INVENTOR_FORGE_WORKDIR": "{job_dir}", "INVENTOR_FORGE_LOGO": "{logo}"}
+    }
+  }
+}

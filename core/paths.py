@@ -57,29 +57,18 @@ def safe_name(name: str, default: str = "file", limit: int = 80) -> str:
 
 
 # --------------------------------------------------------------------------- which arguments are written
-# inventor-forge declares which of its tool arguments it writes or reads (forge/fileargs.py, loaded on its own so
-# FreeCAD-only installs don't need pywin32); for its tools nothing is guessed
-def _forge_fileargs():
-    import importlib.util
-    src = Path(__file__).resolve().parent.parent / "backends" / "inventor" / "forge" / "fileargs.py"
-    spec = importlib.util.spec_from_file_location("hermes_shaperotator_fileargs", src)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)          # type: ignore[union-attr]
-    return mod
-
-
-FA = _forge_fileargs()
-NATIVE_READS = {k: set(v) for k, v in FA.READS.items()}
-NATIVE_NAMES = dict(FA.NAMES)
+# a server with a cad profile (inventor-forge) declares which of its tool arguments it writes, reads or only uses
+# in a file name (cad/files in each tool's _meta); for its tools nothing is guessed
 SAVES_IN_PLACE = {"run_study_cases"}
 
 
-def forge_declares() -> bool:
-    """Is the active backend inventor-forge, whose file arguments are declared (no guessing needed)?"""
+def declared_files(tool: str) -> dict[str, list[str]] | None:
+    """{"writes", "reads", "names"} the active server declares for this tool, or None (undeclared: be cautious)."""
+    from . import server_profile
     try:
-        return STATE.family == "inventor"
+        return server_profile.files(tool)
     except Exception:
-        return False
+        return None
 
 
 # words that make an argument a file location when they end its name: csv_path, filePath, outputDir, dest, saveAs
@@ -167,12 +156,12 @@ def written_args(tool_name: str, args: Any) -> list[tuple[str, str]]:
     if tool_name == "cad_native":
         tool = str(args.get("tool", ""))
         targs = args.get("args") if isinstance(args.get("args"), dict) else {}
-        if forge_declares() and (tool in FA.WRITES or tool in FA.READS or tool in FA.NAMES or tool in FA.KNOWN):
-            # exactly what the forge says this tool writes; a tool this list doesn't know (another forge version)
-            # falls through to the cautious checks below
-            return [(k, targs[k]) for k in FA.WRITES.get(tool, ()) if isinstance(targs.get(k), str) and targs[k].strip()]
-        reads = NATIVE_READS.get(tool, set())
-        names = NATIVE_NAMES.get(tool, ())
+        declared = declared_files(tool)
+        if declared is not None:
+            # exactly what the server says this tool writes; a tool it doesn't list falls through to the cautious
+            # checks below
+            return [(k, targs[k]) for k in declared["writes"] if isinstance(targs.get(k), str) and targs[k].strip()]
+        reads, names = set(), ()
         # arguments named like a location, and any other value that looks like one (servers name them freely:
         # filePath, outputPath, dest...); declared reads, free-text arguments and sanitised names are left out
         return [(k, v) for k, v in _flatten(targs)

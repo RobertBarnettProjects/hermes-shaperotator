@@ -18,19 +18,22 @@ def _tool(name, description, props=None, required=None):
 
 CAD_STATUS = _tool(
     "cad_status",
-    "Show the active CAD backend (FreeCAD or Inventor), whether each backend is installed, the open "
-    "document, and the last geometry delta. Call this first in a CAD task.",
+    "Show the active CAD backend, which CAD programs are on this computer and whether each is ready, the open "
+    "document, and the last geometry delta. Call this first in a CAD task. If it returns setup.ask, no CAD program "
+    "has been chosen yet: ask the user that question once before modelling.",
 )
 
 CAD_BACKEND = _tool(
     "cad_backend",
-    "Switch the CAD backend used by every cad_* tool. 'freecad' = headless FreeCAD (cross-platform). "
-    "'inventor' = Autodesk Inventor via COM (Windows, opens the Inventor window). Only switch when the "
-    "user asks or the current backend lacks a feature. Any other name is a CAD MCP server configured under "
-    "mcp_servers (cad_status lists them) - the plugin is CAD-agnostic: plans, FEA checks, history and "
-    "artifacts work the same on every backend.",
-    {"backend": {"type": "string", "description": "freecad, inventor, or a configured MCP server name"}},
-    ["backend"],
+    "Choose the CAD program every cad_* tool drives. action='list': the CAD programs found on this computer and "
+    "whether each is ready. action='install': download the add-on a CAD program needs (Inventor needs "
+    "inventor-forge, a one-time download into its own environment; the user approves it in a prompt). "
+    "action='use' (default): switch to it and remember the choice. 'freecad' = headless FreeCAD (cross-platform). "
+    "'inventor' = Autodesk Inventor (Windows, opens the Inventor window). Only switch when the user asks or the "
+    "current backend lacks a feature. Any other name is a CAD MCP server configured under mcp_servers - plans, "
+    "FEA checks, history and artifacts work the same on every backend.",
+    {"action": {"type": "string", "enum": ["use", "install", "list"]},
+     "backend": {"type": "string", "description": "freecad, inventor, or a configured MCP server name"}},
 )
 
 CAD_DOCUMENT = _tool(

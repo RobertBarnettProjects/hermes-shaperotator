@@ -25,10 +25,14 @@ _AVAIL_CACHE = {"at": 0.0, "value": False}
 
 
 
-def MOUSE_TOOLS(args: dict) -> tuple:
-    """forge tools that take over the mouse and keyboard (shown the notice in the approval prompt)."""
-    a = args.get("args") or {}
-    return ("analyze_stress", "analyze_modes", "result_at_point") + (("study_report",) if a.get("only_this_study") else ())
+def _takes_input(args: dict) -> bool:
+    """A cad_native call to a tool that takes over the mouse and keyboard (the server's cad/takes_input)."""
+    from .core import server_profile
+    a = args.get("args") if isinstance(args.get("args"), dict) else {}
+    try:
+        return server_profile.takes_input(str(args.get("tool", "")), a)
+    except Exception:
+        return False
 
 def _any_backend_available() -> bool:
     """check_fn for every cad_* tool; cached because the registry may call it often."""
@@ -62,19 +66,17 @@ def _is_pdf_export(tool_name: str, args: Any) -> bool:
 def _native_executes_code(args: Any) -> bool:
     if not isinstance(args, dict):
         return False
+    from .core import server_profile
     name = str(args.get("tool", ""))
     backend = STATE.backend()
-    client = getattr(backend, "client", None)
-    if client is None and getattr(backend, "server", None):
-        client = backend.forge.client
-    description = ""
-    mapped = ""
-    if client is not None:
-        description = str(client.tools.get(name, {}).get("description", ""))
-        mapping = getattr(backend, "ops", {}).get("python")
-        mapped = mapping if isinstance(mapping, str) else (mapping or {}).get("tool", "")
-    import re
-    return name == mapped or bool(re.search(r"python|exec|eval|script|shell|run_code|execute", name + " " + description, re.I))
+    mapping = getattr(backend, "ops", {}).get("python")
+    mapped = mapping if isinstance(mapping, str) else (mapping or {}).get("tool", "")
+    if name and name == mapped:
+        return True
+    try:
+        return server_profile.runs_code(name, server_profile.describe(name))
+    except Exception:
+        return True                       # can't tell: ask
 
 
 NL = chr(10)
@@ -100,6 +102,12 @@ def _pre_tool_call(tool_name: str = "", args: Any = None, **kw: Any):
 
 
 def _pre_tool_call_inner(tool_name: str = "", args: Any = None, **_: Any):
+    if tool_name == "cad_backend" and isinstance(args, dict) and str(args.get("action", "")).lower() == "install":
+        from .core import installer
+        try:
+            return {"action": "approve", "message": installer.install_notice(str(args.get("backend") or ""))}
+        except Exception as e:  # noqa: BLE001
+            return {"action": "block", "message": f"hermes-shaperotator: {e}"}
     if tool_name == "cad_native" and isinstance(args, dict) and args.get("tool") == "answer_dialog":
         ta = args.get("args") if isinstance(args.get("args"), dict) else {}
         return {"action": "approve",
@@ -114,7 +122,7 @@ def _pre_tool_call_inner(tool_name: str = "", args: Any = None, **_: Any):
                            f"with your user permissions:\n\n{preview}"}
     if (tool_name == "cad_plan" and isinstance(args, dict) and args.get("action") == "run"
             and STATE.family == "inventor") or (
-            tool_name == "cad_native" and isinstance(args, dict) and args.get("tool") in MOUSE_TOOLS(args)):
+            tool_name == "cad_native" and isinstance(args, dict) and _takes_input(args)):
         return {"action": "approve",
                 "message": "hermes-shaperotator wants to run Autodesk Inventor's Stress Analysis. Inventor's Stress Analysis has "
                            "no automation API, so this TAKES OVER YOUR MOUSE AND KEYBOARD for about 30-60 seconds: "
@@ -135,6 +143,7 @@ def _pre_tool_call_inner(tool_name: str = "", args: Any = None, **_: Any):
     return None
 
 
+# tools that change the shape, for a server that publishes no cad profile (one that does says so per tool)
 NATIVE_GEOMETRY_TOOLS = {
     "create_part", "create_assembly", "open_document", "activate_document", "undo", "delete_feature", "suppress_feature",
     "extrude", "revolve", "hole", "hole_linear", "fillet", "chamfer", "circular_pattern", "rectangular_pattern", "mirror",
@@ -151,7 +160,11 @@ def _geometry_changed(tool_name: str, args: Any) -> bool:
     if tool_name == "cad_feature":
         return True
     if tool_name == "cad_native":          # read-only tools (list_faces...) must not re-export the whole model
-        return a.get("tool") in NATIVE_GEOMETRY_TOOLS
+        from .core import server_profile
+        try:
+            return server_profile.geometry(str(a.get("tool", "")), NATIVE_GEOMETRY_TOOLS)
+        except Exception:
+            return a.get("tool") in NATIVE_GEOMETRY_TOOLS
     if tool_name == "cad_document":
         return a.get("action") in ("open", "new_part")
     if tool_name == "cad_parameters":
@@ -213,6 +226,12 @@ def _pre_llm_call(session_id: str = "", **_: Any):
     if not STATE.backends or (session_id and session_id not in _CAD_SESSIONS):
         return None
     parts = [f"backend={STATE.backend_name}"]
+    if not STATE.backend_chosen:
+        try:
+            from .core import installer
+            parts.append(installer.setup_question())
+        except Exception:
+            pass
     try:
         from .core import standard as _std
         got = _std.chosen(session_id)
@@ -293,22 +312,28 @@ def _slash(raw_args: str = "", **_: Any) -> str:
 # --------------------------------------------------------------------------- register
 def register(ctx) -> None:
     settings: dict[str, Any] = {}
-    for key, default in (("backend", "freecad"), ("freecad_path", ""), ("standard", ""),
-                         ("job_dir", ""), ("inventor_visible", True), ("mcp_servers", {})):
+    for key, default in (("backend", ""), ("freecad_path", ""), ("standard", ""), ("job_dir", ""),
+                         ("inventor_visible", True), ("mcp_servers", {}), ("server_sources", {})):
         try:
             settings[key] = ctx.get_config(key, default)
         except Exception:
             settings[key] = default
-    if not isinstance(settings.get("mcp_servers"), dict):
-        settings["mcp_servers"] = {}
+    for key in ("mcp_servers", "server_sources"):
+        if not isinstance(settings.get(key), dict):
+            settings[key] = {}
     STATE.settings.update(settings)
-    STATE.backend_name = str(settings.get("backend") or "freecad").lower()
-    if STATE.backend_name not in BACKENDS:
-        STATE.backend_name = "freecad"
+    from .core import installer
+    explicit = str(settings.get("backend") or "").lower()       # fixed in the plugin settings
+    remembered = installer.chosen().lower()                     # picked by the user in an earlier chat
+    pick = explicit if explicit in BACKENDS else remembered if remembered in BACKENDS else ""
+    STATE.backend_chosen = pick
+    STATE.backend_name = pick or "freecad"
 
     for schema in schemas.ALL:
-        ctx.register_tool(name=schema["name"], toolset=TOOLSET, schema=schema,
-                          handler=HANDLERS[schema["name"]], check_fn=_any_backend_available)
+        # status and backend choice stay usable when no CAD program is ready yet: that is how one gets set up
+        always = schema["name"] in ("cad_status", "cad_backend")
+        ctx.register_tool(name=schema["name"], toolset=TOOLSET, schema=schema, handler=HANDLERS[schema["name"]],
+                          check_fn=(lambda: True) if always else _any_backend_available)
 
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("post_tool_call", _post_tool_call)

@@ -40,6 +40,11 @@ class McpClient:
         self.proc: subprocess.Popen | None = None
         self.server_info: dict = {}
         self.instructions = ""
+        self.profile: dict | None = None        # the server's cad/profile (initialize, capabilities.experimental)
+        self.last_progress = ""               # the latest progress message of a running call
+        self.on_progress = None                 # optional callback(message) for progress notifications
+        self._progress_at: dict[int, float] = {}
+        self.progress_grace_s = 60.0            # how long after the last progress report a call still counts as alive
         self._tools: dict[str, dict] | None = None
         self._id = 0
         self._lock = threading.Lock()          # one request in flight (CAD programs are single-threaded)
@@ -70,6 +75,8 @@ class McpClient:
                                                "clientInfo": {"name": "hermes-shaperotator", "version": "1"}}, timeout=min(120, self.timeout))
             self.server_info = init.get("serverInfo") or {}
             self.instructions = init.get("instructions") or ""
+            prof = ((init.get("capabilities") or {}).get("experimental") or {}).get("cad/profile")
+            self.profile = prof if isinstance(prof, dict) else None
             self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
             self.initialized = True
             return self
@@ -158,6 +165,9 @@ class McpClient:
             if "method" in msg and "id" in msg:
                 threading.Thread(target=self._answer, args=(msg, p), daemon=True).start()
                 continue
+            if msg.get("method") == "notifications/progress":
+                self._progress(msg.get("params") or {})
+                continue
             event = self._pending_calls.get(msg.get("id"))
             if event is not None and ("result" in msg or "error" in msg):
                 event.set()
@@ -168,6 +178,21 @@ class McpClient:
             return
         for q in list(self._replies.values()):
             q.put({"error": {"message": f"MCP server exited; stderr: {self.stderr_tail()}"}})
+
+    def _progress(self, params: dict) -> None:
+        """A running call reported progress: the server is alive and working on it."""
+        token = params.get("progressToken")
+        if token in self._replies:
+            self._progress_at[token] = time.monotonic()
+        text = str(params.get("message") or "")
+        if text:
+            self.last_progress = text[:300]
+            cb = self.on_progress
+            if cb is not None:
+                try:
+                    cb(self.last_progress)
+                except Exception:
+                    pass
 
     def _read_stderr(self, p) -> None:
         while self.proc is p:
@@ -195,20 +220,37 @@ class McpClient:
             rid, q = self._id, queue.Queue()
             self._replies[rid] = q
             event = threading.Event()
+            params = dict(params or {})
             if method == "tools/call":
                 self._pending_calls[rid] = event
+                params["_meta"] = {**(params.get("_meta") or {}), "progressToken": rid}
+                self.last_progress = ""
+            budget = deadline - time.monotonic()
+            # a call whose server keeps reporting progress may run past its budget, up to twice it: the server is
+            # evidently alive and working (its own limits end a stuck step), so giving up would only orphan the work
+            ceiling = deadline + (budget if method == "tools/call" else 0)
+            grace = max(self.progress_grace_s, 4 * float((self.profile or {}).get("progress_every_s") or 0))
             try:
-                self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}}, timeout=deadline - time.monotonic())
-                try:
-                    msg = q.get(timeout=max(0, deadline - time.monotonic()))
-                except queue.Empty:
-                    raise McpError(f"MCP {method} timed out after {timeout or self.timeout:.0f} s") from None
+                self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, timeout=budget)
+                while True:
+                    try:
+                        msg = q.get(timeout=max(0, min(deadline, ceiling) - time.monotonic()))
+                        break
+                    except queue.Empty:
+                        last = self._progress_at.get(rid)
+                        now = time.monotonic()
+                        if last is not None and now - last < grace and now < ceiling:
+                            deadline = now + grace       # still working: keep waiting
+                            continue
+                        raise McpError(f"MCP {method} timed out after {timeout or self.timeout:.0f} s"
+                                       + (f" (last progress: {self.last_progress})" if self.last_progress else "")) from None
             except McpError as e:
                 if method == "tools/call" and "timed out" in str(e):
                     self.uncertain = True
                 raise
             finally:
                 self._replies.pop(rid, None)
+                self._progress_at.pop(rid, None)
                 if event.is_set() or not self.uncertain:
                     self._pending_calls.pop(rid, None)
         finally:

@@ -50,7 +50,8 @@ def test_write_outside_the_job_folder_needs_approval(job, tmp_path, monkeypatch)
         assert out and out["action"] == "approve" and "authorized_keys" in out["message"], name
 
 
-def test_writes_inside_the_job_folder_and_reads_anywhere_need_no_prompt(job, tmp_path):
+def test_writes_inside_the_job_folder_and_reads_anywhere_need_no_prompt(job, tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "declared_files", DECLARED.get)      # what a running inventor-forge declares
     assert P._pre_tool_call(tool_name="cad_document", args={"action": "export", "path": "model.step"}) is None
     assert P._pre_tool_call(tool_name="cad_document", args={"action": "open", "path": str(tmp_path / "a.ipt")}) is None
     assert P._pre_tool_call(tool_name="cad_native",
@@ -226,8 +227,14 @@ def test_answering_an_inventor_dialog_needs_approval(job):
     assert out and out["action"] == "approve" and "'Yes'" in out["message"]
 
 
+DECLARED = {"export_document": {"writes": ["path"], "reads": [], "names": []},
+            "bill_of_materials": {"writes": ["csv_path"], "reads": [], "names": []},
+            "open_document": {"writes": [], "reads": ["path"], "names": []},
+            "add_general_notes": {"writes": [], "reads": [], "names": []}}
+
+
 def test_forge_backend_uses_declared_file_arguments(job, tmp_path, monkeypatch):
-    monkeypatch.setattr(paths, "forge_declares", lambda: True)
+    monkeypatch.setattr(paths, "declared_files", DECLARED.get)
     out = P._pre_tool_call(tool_name="cad_native", args={"tool": "export_document", "args": {"path": str(tmp_path / "a.step")}})
     assert out and out["action"] == "approve"
     out = P._pre_tool_call(tool_name="cad_native", args={"tool": "bill_of_materials", "args": {"csv_path": str(tmp_path / "b.csv")}})
@@ -239,6 +246,6 @@ def test_forge_backend_uses_declared_file_arguments(job, tmp_path, monkeypatch):
 
 
 def test_tool_unknown_to_this_forge_version_is_checked_cautiously(job, tmp_path, monkeypatch):
-    monkeypatch.setattr(paths, "forge_declares", lambda: True)
+    monkeypatch.setattr(paths, "declared_files", DECLARED.get)
     out = P._pre_tool_call(tool_name="cad_native", args={"tool": "future_export", "args": {"out_path": str(tmp_path / "x.txt")}})
     assert out and out["action"] == "approve"
