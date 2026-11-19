@@ -7,7 +7,7 @@ import os
 import time
 from typing import Any
 
-from .core import schemas
+from .core import schemas, writescope
 from .core.evidence import EVIDENCE
 from .core.scene import publish_geometry
 from .core.state import BACKENDS, STATE
@@ -107,12 +107,19 @@ def _pre_tool_call(tool_name: str = "", args: Any = None, **kw: Any):
                                "refused or nobody could answer it, tell the user; don't install or change it another "
                                "way."}
         return None
-    from .core.paths import outside_writes
+    from .core.paths import outside_files, outside_writes
     from .core.workbench import LIVE
     STATE.session_id = str(kw.get("session_id") or "")
     outside, bad = outside_writes(str(tool_name), args)
     if bad:
         return {"action": "block", "message": "hermes-shaperotator: " + "; ".join(bad)}
+    # files outside the job folder this exact call may write once approved: the ones found in its arguments, and
+    # the ones the CAD server refused when the same call was sent before (saves of changed referenced documents,
+    # a final name that differs from the one given)
+    key = writescope.call_key(str(tool_name), args)
+    refused = writescope.needed(key)
+    outside += [f"{f} (the CAD server reports this call also writes it)" for f in refused]
+    writescope.stage(key, outside_files(str(tool_name), args) + refused)
     LIVE.enter()
     out = _pre_tool_call_inner(tool_name, args, **kw)
     if outside and (out is None or out.get("action") == "approve"):
@@ -372,7 +379,8 @@ def register(ctx) -> None:
     for schema in schemas.ALL:
         # status and backend choice stay usable when no CAD program is ready yet: that is how one gets set up
         always = schema["name"] in ("cad_status", "cad_backend")
-        ctx.register_tool(name=schema["name"], toolset=TOOLSET, schema=schema, handler=HANDLERS[schema["name"]],
+        ctx.register_tool(name=schema["name"], toolset=TOOLSET, schema=schema,
+                          handler=writescope.scoped(schema["name"], HANDLERS[schema["name"]]),
                           check_fn=(lambda: True) if always else _any_backend_available)
 
     ctx.register_hook("pre_tool_call", _pre_tool_call)

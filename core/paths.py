@@ -188,6 +188,29 @@ def implicit_save(tool_name: str, args: Any) -> bool:
     return False
 
 
+def outside_files(tool_name: str, args: Any) -> list[str]:
+    """The resolved files outside the job folder this call names (what an approval of it allows the server to write);
+    paths the plugin can't resolve itself are left to the server, which refuses them and names them instead."""
+    out = []
+    for _key, value in written_args(tool_name, args):
+        try:
+            rp = resolve(value)
+        except PathError:
+            continue
+        if not inside_jobs(rp):
+            out.append(str(rp))
+    if implicit_save(tool_name, args):
+        target = open_document_path()
+        if target and target != UNKNOWN:
+            try:
+                rp = Path(target).resolve(strict=False)
+                if not inside_jobs(rp):
+                    out.append(str(rp))
+            except OSError:
+                pass
+    return out
+
+
 UNKNOWN = "?"
 
 

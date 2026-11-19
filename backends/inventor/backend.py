@@ -16,6 +16,8 @@ from typing import Any
 
 from ...core.backend import BackendError, CadBackend
 
+CLOSE_GRACE_S = 120.0          # how long inventor-forge gets to close its own Inventor before it is ended
+
 
 class _McpForge:
     """inventor-forge over MCP: the client plus forge's connect / re-sync rules."""
@@ -42,7 +44,9 @@ class _McpForge:
         return result
 
     def close(self) -> None:
-        self.client.close()
+        # inventor-forge closes the Inventor it started when its input ends (or shows it, if work is unsaved); an
+        # Inventor that is ended halfway through closing can leave an error window, so it gets time to finish
+        self.client.close(grace_s=CLOSE_GRACE_S)
 
 
 class InventorBackend(CadBackend):

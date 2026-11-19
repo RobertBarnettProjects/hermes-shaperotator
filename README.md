@@ -161,7 +161,9 @@ reported when an analysis computed one. The footer is append-only, so streaming 
 ## Disclosures (risky behaviour)
 
 - **Runs local programs:** starts FreeCAD's Python as a worker process (`freecad_path`), which runs Gmsh
-  and CalculiX; on Windows can drive Autodesk Inventor over COM (it may start Inventor).
+  and CalculiX; on Windows can drive Autodesk Inventor over COM. It starts a separate Inventor for each chat
+  (an Inventor you have open is left alone unless you ask for it) and closes it when the chat ends; one holding
+  unsaved changes is shown and left open for you instead.
 - **Arbitrary code (opt-in per call):** `cad_python` executes Python inside FreeCAD/Inventor with your user
   permissions. It always goes through Hermes's approval prompt (refused when nobody answers). inventor-forge also
   has an `execute_python` tool; `cad_native` refuses it and points to `cad_python`.
@@ -183,6 +185,12 @@ reported when an analysis computed one. The footer is append-only, so streaming 
   HTML report to its working folder.
 - **Files:** reads files you name (`open`, STEP for FEA) and writes models, renders, FEA working folders and
   exports under the plugin data folder (or `job_dir`), plus paths you give to `save`/`export`.
+  Every call to the CAD add-on carries the folders and files it may write (`cad/write_scope`): the job folder,
+  plus files outside it that you approved for that call. inventor-forge checks this at each write, including the
+  changed parts an assembly save also writes and a name that changes on the way (an added extension, a `.dwg`
+  fallback), and refuses before writing anything else; the refusal names the files, and the same call sent again
+  asks you about them. Inventor itself still writes its stress-analysis reports and solver scratch folders to its
+  own working folders.
 - **Modifies replies:** appends a verification footer to assistant messages that contain engineering
   figures (text only, appended — never edits what the model wrote).
 - Configured MCP commands launch child processes with your permissions. They get a minimal environment (what the OS needs) plus the server's own `env` from config, not Hermes's provider keys; the same goes for the FreeCAD worker and the headless browser. MCP servers are read only from the plugin's `mcp_servers` config.

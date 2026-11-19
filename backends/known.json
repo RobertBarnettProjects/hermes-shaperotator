@@ -27,14 +27,15 @@
       "version": "0.2.0",
       "licence": "MIT",
       "repo": "https://github.com/RobertBarnettProjects/inventor-forge",
-      "commit": "6c2dd34be9553462e141863a84fde2549b38f524",
+      "commit": "da4e34cb18f04eab90abcf482d88fd84080e74fa",
       "also_installs": "pywin32 (from PyPI)",
       "size_mb": 25,
       "env": {
         "INVENTOR_FORGE_WORKDIR": "{job_dir}",
-        "INVENTOR_FORGE_LOGO": "{logo}"
+        "INVENTOR_FORGE_LOGO": "{logo}",
+        "INVENTOR_FORGE_PRIVATE": "1"
       },
-      "archive_sha256": "85505dc8e660c70712bdaae7f33201f625aa713d6738485dc8f7082ae6458609"
+      "archive_sha256": "8141efe2f9da71d8d0a6018099d989eb6e32f099bc206af7601e0bc43a833e98"
     }
   }
 }

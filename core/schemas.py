@@ -30,7 +30,8 @@ CAD_BACKEND = _tool(
     "inventor-forge, a one-time download into its own environment; the user approves it in a prompt. If the prompt "
     "is refused or can't be shown, tell the user; never install it another way). "
     "action='use' (default): switch to it and remember the choice. 'freecad' = headless FreeCAD (cross-platform). "
-    "'inventor' = Autodesk Inventor (Windows, opens the Inventor window). Only switch when the user asks or the "
+    "'inventor' = Autodesk Inventor (Windows; starts an Inventor of its own for this chat, leaving one the user has "
+    "open alone, and closes it when the chat ends). Only switch when the user asks or the "
     "current backend lacks a feature. Any other name is a CAD MCP server configured under mcp_servers - plans, "
     "FEA checks, history and artifacts work the same on every backend.",
     {"action": {"type": "string", "enum": ["use", "install", "list"]},

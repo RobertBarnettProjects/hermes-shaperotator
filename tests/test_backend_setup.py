@@ -303,3 +303,24 @@ def test_add_on_folder_is_only_reached_through_the_approved_install(data):
         assert d and d["action"] == "block" and "cad_backend(action='install')" in d["message"], (tool, args)
     assert P._pre_tool_call(tool_name="terminal", args={"command": "dir C:\\Users"}) is None
     assert P._pre_tool_call(tool_name="read_file", args={"path": str(data / "jobs" / "a.step")}) is None
+
+
+def test_a_graceful_close_lets_the_server_tidy_up(tmp_path):
+    import subprocess
+    import time
+    from hermes_shaperotator.core.mcp_client import McpClient
+    marker = tmp_path / "tidied"
+    script = tmp_path / "server.py"
+    script.write_text("import sys, pathlib, time\n"
+                      "sys.stdin.read()\n"
+                      "time.sleep(0.5)\n"
+                      f"pathlib.Path({str(marker)!r}).write_text('done')\n", encoding="utf-8")
+    c = McpClient([sys.executable, str(script)])
+    c.proc = subprocess.Popen([sys.executable, str(script)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+    p = c.proc
+    t0 = time.monotonic()
+    c.close(grace_s=30)
+    assert time.monotonic() - t0 < 2 and c.proc is None          # close never waits for the server
+    p.wait(timeout=20)
+    assert marker.read_text() == "done"

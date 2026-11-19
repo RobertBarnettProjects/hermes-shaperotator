@@ -97,11 +97,30 @@ class McpClient:
             self._close()
             raise
 
-    def close(self) -> None:
+    def close(self, grace_s: float = 0.0) -> None:
+        """Stop the server. grace_s > 0: end its input and let it exit by itself (tidying up what it started), and
+        only kill it if it is still running after grace_s; the wait happens in the background, never here."""
         with self._life:
+            p = self.proc
+            if grace_s > 0 and p is not None and p.poll() is None:
+                self.proc = None
+                try:
+                    p.stdin.close()
+                except (OSError, ValueError, AttributeError):
+                    pass
+
+                def reap():
+                    try:
+                        p.wait(timeout=grace_s)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                threading.Thread(target=reap, daemon=True, name="mcp-close").start()
+                self.proc = p                              # _close clears the rest of the state below
+                self._close(kill=False)
+                return
             self._close()
 
-    def _close(self) -> None:
+    def _close(self, kill: bool = True) -> None:
         p, self.proc = self.proc, None
         self.initialized = False
         self._tools = None
@@ -111,9 +130,10 @@ class McpClient:
         for q in list(self._replies.values()):
             q.put({"error": {"message": "MCP transport closed"}})
         if p:
-            if p.poll() is None:
-                p.kill()
-            p.wait(timeout=10)
+            if kill:
+                if p.poll() is None:
+                    p.kill()
+                p.wait(timeout=10)
             # A descendant may still hold a pipe open. Pipe cleanup must never hold up a deadline.
             def close_pipes():
                 for stream in (p.stdin, p.stdout, p.stderr):
@@ -241,7 +261,9 @@ class McpClient:
             params = dict(params or {})
             if method == "tools/call":
                 self._pending_calls[rid] = event
-                params["_meta"] = {**(params.get("_meta") or {}), "progressToken": rid}
+                from .writescope import current as _write_scope
+                params["_meta"] = {**(params.get("_meta") or {}), "progressToken": rid,
+                                   "cad/write_scope": _write_scope()}
                 self.last_progress = ""
             budget = deadline - time.monotonic()
             # a call whose server keeps reporting progress may run past its budget, up to twice it: the server is
