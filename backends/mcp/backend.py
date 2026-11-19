@@ -99,6 +99,10 @@ class McpBackend(CadBackend):
     def tool_names(self) -> list[str]:
         return sorted(self.client.tools)
 
+    def _wait(self, tool: str, args: dict) -> float:
+        from ...core import server_profile
+        return server_profile.budget(tool, args, self.client.timeout, c=self.client)
+
     def _route(self, op: str, kwargs: dict) -> tuple[str, dict]:
         m = self.ops.get(op, op)
         if isinstance(m, str):
@@ -116,7 +120,9 @@ class McpBackend(CadBackend):
                     raise BackendError(f"unknown {self.name} tool {tool!r}; available: {', '.join(self.tool_names())}")
                 read_ops = {"status", "inspect", "get_parameters", "list_edges", "list_faces", "find_edge", "find_face"}
                 read_tools = {self._route(op, {})[0] for op in read_ops}
-                return self.client.call(tool, k.get("args") or {}, mutating=False if tool in read_tools else None)
+                targs = k.get("args") or {}
+                return self.client.call(tool, targs, mutating=False if tool in read_tools else None,
+                                        timeout=self._wait(tool, targs))
             if op == "connect":
                 self.client.start()
                 self.client.wait_for_pending_calls()
@@ -137,6 +143,6 @@ class McpBackend(CadBackend):
                                    f"or use cad_native with one of: {', '.join(self.tool_names())}")
             return self.client.call(tool, args, mutating=False if op in {
                 "status", "inspect", "get_parameters", "list_edges", "list_faces", "find_edge", "find_face"
-            } else None)
+            } else None, timeout=self._wait(tool, args))
         except McpError as e:
             raise BackendError(f"{self.name}: {e}") from e

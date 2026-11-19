@@ -89,7 +89,8 @@ def cad_status(args: dict, **_: Any) -> str:
             ok, why = False, f"configuration error: {e}"
         avail[name] = {"available": ok, "detail": why}
     doc = None
-    if avail[STATE.backend_name]["available"] and STATE.backend_name in STATE.backends:
+    # the open document only from a backend already in use: a status call must never start a CAD program
+    if STATE.backend_chosen and avail[STATE.backend_name]["available"] and _started(STATE.backends.get(STATE.backend_name)):
         try:
             doc = _call("status")
         except BackendError as e:
@@ -104,6 +105,16 @@ def cad_status(args: dict, **_: Any) -> str:
                last_delta=STATE.last_delta or None,
                standard=std or {"chosen": False, "ask": _std.ASK},
                job_folder=str(STATE.jobs()), drawing_qa={"dirty": STATE.qa.dirty, "issues": STATE.qa.last_issues})
+
+
+def _started(b) -> bool:
+    """Is this backend's CAD program (or server) already running for this session?"""
+    if b is None:
+        return False
+    c = getattr(b, "client", None)
+    if c is not None:
+        return bool(getattr(c, "initialized", False))
+    return getattr(b, "_client", None) is not None
 
 
 @safe
@@ -137,12 +148,19 @@ def cad_backend(args: dict, **_: Any) -> str:
     if not ok:
         return _err(why)
     res = b.call("connect")              # only switch once it actually connected
+    try:
+        installer.remember(name)
+        kept = "remembered for later chats"
+    except OSError as e:
+        kept = f"not remembered for later chats ({e})"
+    fixed = str(STATE.settings.get("backend") or "").lower()
+    if fixed and fixed != name:
+        kept = f"for this session; the plugin setting backend={fixed} applies again after a restart"
     STATE.backend_name = name
     STATE.backend_chosen = name
-    installer.remember(name)
     STATE.last_delta = ""
     STATE.qa.dirty, STATE.qa.last_issues = True, None
-    return _ok(message=f"backend is now {name} (remembered for later chats)", detail=res)
+    return _ok(message=f"backend is now {name} ({kept})", detail=res)
 
 
 @safe
@@ -592,9 +610,14 @@ def cad_native(args: dict, **_: Any) -> str:
                                       or str(targs.get("path", "")).lower().endswith(".pdf")):
         return _err("PDF export: use cad_drawing(action='export_pdf') so the QA gate applies")
     from . import server_profile
-    if server_profile.takes_input(tool, targs):
+    if server_profile.takes_input(tool, targs) and server_profile.accepts(tool, "user_notified"):
         # the pre_tool_call hook showed the mouse/keyboard notice in Hermes's approval prompt and the user approved
         targs["user_notified"] = True
+    if tool in ("create_drawing", "make_part_sheet", "make_assembly_sheet") and not targs.get("standard"):
+        from . import standard as _std
+        chosen = _std.chosen()
+        if chosen and server_profile.accepts(tool, "standard"):
+            targs["standard"] = chosen["standard"]      # the chat's standard, as the portable drawing tools use
     for key in (server_profile.files(tool) or {}).get("names", ()):
         if isinstance(targs.get(key), str) and targs[key]:
             targs[key] = _paths.safe_name(targs[key])        # these become file names inside Inventor's workdir
@@ -662,7 +685,8 @@ def cad_native(args: dict, **_: Any) -> str:
         STATE.qa.last_issues = r.get("total")
         STATE.qa.last_report = r.get("report", "")
         STATE.qa.dirty = r.get("total") != 0
-    elif tool in DRAWING_NATIVE_MUTATING:
+    elif tool in DRAWING_NATIVE_MUTATING or not server_profile.read_only(tool):
+        # anything that may change the model or a sheet needs a fresh check before a PDF goes out
         STATE.qa.dirty = True
         STATE.qa.last_issues = None
     return _ok(tool=tool, **r)

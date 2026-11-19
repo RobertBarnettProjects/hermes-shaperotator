@@ -44,7 +44,9 @@ class McpClient:
         self.last_progress = ""               # the latest progress message of a running call
         self.on_progress = None                 # optional callback(message) for progress notifications
         self._progress_at: dict[int, float] = {}
+        self._life = threading.RLock()          # start, close and client creation one at a time
         self.progress_grace_s = 60.0            # how long after the last progress report a call still counts as alive
+        self._progress_every = 0.0
         self._tools: dict[str, dict] | None = None
         self._id = 0
         self._lock = threading.Lock()          # one request in flight (CAD programs are single-threaded)
@@ -54,10 +56,14 @@ class McpClient:
 
     # ------------------------------------------------------------------ process
     def start(self) -> "McpClient":
+        with self._life:
+            return self._start()
+
+    def _start(self) -> "McpClient":
         if self.initialized and self.proc and self.proc.poll() is None:
             return self
         if self.proc:
-            self.close()
+            self._close()
         self._tools = None
         self._write_lock = threading.Lock()
         from .paths import child_env
@@ -77,14 +83,25 @@ class McpClient:
             self.instructions = init.get("instructions") or ""
             prof = ((init.get("capabilities") or {}).get("experimental") or {}).get("cad/profile")
             self.profile = prof if isinstance(prof, dict) else None
+            try:                                   # a timing the server states must be a sane number
+                every = float((self.profile or {}).get("progress_every_s") or 0)
+                if not (0 <= every <= 3600):
+                    raise ValueError
+            except (TypeError, ValueError):
+                every = 0.0
+            self._progress_every = every
             self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
             self.initialized = True
             return self
         except Exception:
-            self.close()
+            self._close()
             raise
 
     def close(self) -> None:
+        with self._life:
+            self._close()
+
+    def _close(self) -> None:
         p, self.proc = self.proc, None
         self.initialized = False
         self._tools = None
@@ -182,8 +199,9 @@ class McpClient:
     def _progress(self, params: dict) -> None:
         """A running call reported progress: the server is alive and working on it."""
         token = params.get("progressToken")
-        if token in self._replies:
-            self._progress_at[token] = time.monotonic()
+        if token not in self._replies:
+            return                                  # a call that has already ended: nothing to show
+        self._progress_at[token] = time.monotonic()
         text = str(params.get("message") or "")
         if text:
             self.last_progress = text[:300]
@@ -229,9 +247,11 @@ class McpClient:
             # a call whose server keeps reporting progress may run past its budget, up to twice it: the server is
             # evidently alive and working (its own limits end a stuck step), so giving up would only orphan the work
             ceiling = deadline + (budget if method == "tools/call" else 0)
-            grace = max(self.progress_grace_s, 4 * float((self.profile or {}).get("progress_every_s") or 0))
+            grace = max(self.progress_grace_s, 4 * self._progress_every)
+            sent = False
             try:
                 self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, timeout=budget)
+                sent = True
                 while True:
                     try:
                         msg = q.get(timeout=max(0, min(deadline, ceiling) - time.monotonic()))
@@ -240,12 +260,15 @@ class McpClient:
                         last = self._progress_at.get(rid)
                         now = time.monotonic()
                         if last is not None and now - last < grace and now < ceiling:
-                            deadline = now + grace       # still working: keep waiting
+                            deadline = min(last + grace, ceiling)    # alive: wait one grace past its last report
                             continue
                         raise McpError(f"MCP {method} timed out after {timeout or self.timeout:.0f} s"
                                        + (f" (last progress: {self.last_progress})" if self.last_progress else "")) from None
+                if method == "tools/call" and mutating and "error" in msg and "id" not in msg:
+                    # the transport went away before the server answered a change: it may or may not have happened
+                    self.uncertain = True
             except McpError as e:
-                if method == "tools/call" and "timed out" in str(e):
+                if method == "tools/call" and ("timed out" in str(e) or (sent and mutating)):
                     self.uncertain = True
                 raise
             finally:

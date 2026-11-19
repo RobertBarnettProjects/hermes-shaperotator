@@ -114,6 +114,24 @@ def _pre_tool_call_inner(tool_name: str = "", args: Any = None, **_: Any):
                 "message": f"hermes-shaperotator wants to press '{ta.get('button', '?')}' on an Inventor dialog"
                            + (f" ('{ta['title']}')" if ta.get("title") else "")
                            + ". Approve only if that is the answer you want (e.g. not 'Don't save' on unsaved work)."}
+    if tool_name == "cad_native" and isinstance(args, dict):
+        from .core import server_profile
+        t = str(args.get("tool", ""))
+        ta = args.get("args") if isinstance(args.get("args"), dict) else {}
+        try:
+            gone = server_profile.deletes(t, ta)
+            unknown = server_profile.undeclared_change(t)
+        except Exception:
+            gone = unknown = False
+        if gone:
+            return {"action": "approve",
+                    "message": f"hermes-shaperotator wants {t} to delete permanently (it can't be undone):\n\n"
+                               + json.dumps(ta, default=str)[:1200] + "\n\nApprove only if you agreed to this list."}
+        if unknown and not _native_executes_code(args):
+            return {"action": "approve",
+                    "message": f"hermes-shaperotator wants to call {t} on {STATE.backend_name}. That server doesn't "
+                               "describe what its tools do, so this call may change files or run code outside the "
+                               "plugin's checks:\n\n" + json.dumps(ta, default=str)[:1200]}
     if tool_name == "cad_python" or (tool_name == "cad_native" and _native_executes_code(args)):
         code = str((args or {}).get("code", args) if isinstance(args, dict) else "")
         preview = code if len(code) <= 1200 else code[:1200] + "\n... (truncated)"

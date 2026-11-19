@@ -29,8 +29,9 @@ KNOWN_FILE = Path(__file__).resolve().parent.parent / "backends" / "known.json"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _LOCK = threading.Lock()
 INSTALL_TIMEOUT_S = 900
-NETWORK_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_CERT",
-               "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE")
+# a proxy and its certificates still apply; pip's own settings (other indexes, config files) don't: pip runs isolated
+NETWORK_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE")
+_APPROVED: dict[str, str] = {}          # backend -> the requirement the user was shown and approved
 
 
 class InstallError(RuntimeError):
@@ -130,9 +131,21 @@ def server_dir(name: str) -> Path:
     return _data_dir() / "servers" / name.lower()
 
 
+def _py_in(venv: Path) -> Path:
+    return venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+
+
 def _venv_python(name: str) -> Path:
-    d = server_dir(name) / "venv"
-    return d / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    """The interpreter of the backend's active environment (the one its installed.json names)."""
+    rec = _record(name)
+    venv = server_dir(name) / (rec.get("venv") or "venv")
+    return _py_in(venv)
+
+
+def redact(text: str) -> str:
+    """A source shown or logged without any user:password@ it carries."""
+    import re
+    return re.sub(r"(?<=://)[^/@\s]+@", "***@", str(text))
 
 
 def _record(name: str) -> dict:
@@ -170,6 +183,7 @@ def server_status(name: str) -> dict:
     except InstallError:
         want = rec.get("requirement")
     current = rec.get("requirement") == want
+    rec = {**rec, "source": redact(rec.get("source", ""))}
     return {"installed": True, "current": current, "package": srv.get("package"), "version": rec.get("version"),
             "pinned_version": srv.get("version"), "at": rec.get("at"),
             "detail": "up to date" if current else
@@ -182,6 +196,8 @@ def install_notice(name: str) -> str:
     spec = entry(name)
     srv = spec.get("server") or {}
     req, what = _source(name, srv)
+    _APPROVED[name.lower()] = req          # install() installs exactly this, or asks again
+    what = redact(what)
     return (f"hermes-shaperotator wants to download and install {srv.get('package')} {srv.get('version', '')} "
             f"({srv.get('licence', '')} licence), the add-on that drives {spec.get('title', name)}: {what}, plus "
             f"{srv.get('also_installs', 'its dependencies')}; about {srv.get('size_mb', '?')} MB. It goes into its own "
@@ -189,12 +205,13 @@ def install_notice(name: str) -> str:
             "folder removes it. Approve only if you want this CAD program used.")
 
 
-def _run(cmd: list[str], log, timeout: float) -> None:
+def _run(cmd: list[str], log, timeout: float, cwd: Path | None = None) -> None:
     env = child_env({k: os.environ[k] for k in NETWORK_ENV if k in os.environ} | {"PIP_DISABLE_PIP_VERSION_CHECK": "1",
                                                                                  "PYTHONUNBUFFERED": "1"})
-    log.write(f"$ {' '.join(cmd)}\n")
+    log.write(f"$ {redact(' '.join(cmd))}\n")
     log.flush()
-    p = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, timeout=timeout,
+    # run from the backend's own folder, so nothing in Hermes's working folder can stand in for a module
+    p = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, timeout=timeout, cwd=str(cwd) if cwd else None,
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if p.returncode:
         raise InstallError(f"{cmd[2] if len(cmd) > 2 else cmd[0]} failed (exit {p.returncode}); see {log.name}")
@@ -208,39 +225,61 @@ def _base_python() -> str:
 
 
 def install(name: str) -> dict:
-    """Create the backend's own environment and pip-install its server (the user approved this first)."""
+    """Install the backend's server into a new environment of its own (the user approved exactly this source
+    first). The environment in use is left alone until the new one has installed and imported cleanly; only then
+    does installed.json switch to it, and the previous one is removed."""
+    import shutil
     spec = entry(name)
     srv = spec.get("server")
     if not srv:
         return {"installed": True, "detail": f"{spec.get('title', name)} is built in"}
     req, what = _source(name, srv)
+    if _APPROVED.get(name.lower()) != req:
+        raise InstallError("the source to install isn't the one shown in the approval prompt (it changed, or no "
+                           "prompt was shown); ask again with cad_backend(action='install')")
     with _LOCK:
         d = server_dir(name)
         d.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
-        old = STATE.backends.pop(name.lower(), None)          # a running server holds files in the old environment
+        import uuid
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        venv = d / f"venv-{stamp}-{uuid.uuid4().hex[:6]}"      # never the name of the environment in use
+        prev = _record(name)
+        try:
+            with open(d / f"install-{stamp}.log", "w", encoding="utf-8") as log:
+                _run([_base_python(), "-I", "-m", "venv", str(venv)], log, 300, cwd=d)
+                py = str(_py_in(venv))
+                pip = [py, "-I", "-m", "pip", "--isolated", "install", "--no-input"]
+                _run(pip + ["--no-deps", req], log, INSTALL_TIMEOUT_S, cwd=d)
+                _run(pip + [req], log, INSTALL_TIMEOUT_S, cwd=d)              # its dependencies
+                probe = subprocess.run([py, "-I", "-c",
+                                        f"import importlib.metadata as m; print(m.version({srv['package']!r}))"],
+                                       capture_output=True, text=True, timeout=120, env=child_env(), cwd=str(d),
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                version = probe.stdout.strip()
+                if probe.returncode or not version:
+                    raise InstallError(f"{srv['package']} installed but can't be imported: "
+                                       f"{probe.stderr.strip()[-400:]}")
+        except BaseException:
+            if venv.name != prev.get("venv"):
+                shutil.rmtree(venv, ignore_errors=True)                # the environment in use is untouched
+            raise
+        old = STATE.backends.pop(name.lower(), None)                   # its server runs from the old environment
         if old is not None:
             try:
                 old.shutdown()
             except Exception:
                 pass
-        with open(d / "install.log", "w", encoding="utf-8") as log:
-            if not _venv_python(name).exists():
-                _run([_base_python(), "-m", "venv", str(d / "venv")], log, 300)
-            py = str(_venv_python(name))
-            _run([py, "-m", "pip", "install", "--no-input", "--upgrade", "--force-reinstall", "--no-deps", req], log,
-                 INSTALL_TIMEOUT_S)
-            _run([py, "-m", "pip", "install", "--no-input", req], log, INSTALL_TIMEOUT_S)   # its dependencies
-            probe = subprocess.run([py, "-c", f"import importlib.metadata as m; print(m.version({srv['package']!r}))"],
-                                   capture_output=True, text=True, timeout=120, env=child_env(),
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            version = probe.stdout.strip()
-            if probe.returncode or not version:
-                raise InstallError(f"{srv['package']} installed but can't be imported: {probe.stderr.strip()[-400:]}")
-        rec = {"package": srv["package"], "version": version, "requirement": req, "source": what,
-               "at": time.strftime("%Y-%m-%d %H:%M:%S"), "seconds": round(time.time() - t0)}
-        (d / "installed.json").write_text(json.dumps(rec, indent=1), encoding="utf-8")
-    return {"installed": True, **rec, "folder": str(d)}
+        rec = {"package": srv["package"], "version": version, "requirement": req, "source": redact(what),
+               "venv": venv.name, "at": time.strftime("%Y-%m-%d %H:%M:%S"), "seconds": round(time.time() - t0)}
+        tmp = d / "installed.json.tmp"
+        tmp.write_text(json.dumps(rec, indent=1), encoding="utf-8")
+        tmp.replace(d / "installed.json")                              # the switch: one atomic rename
+        _APPROVED.pop(name.lower(), None)
+        old_venv = d / (prev.get("venv") or "venv")
+        if prev and old_venv != venv:
+            shutil.rmtree(old_venv, ignore_errors=True)
+    return {"installed": True, **{k: v for k, v in rec.items() if k != "requirement"}, "folder": str(d)}
 
 
 def server_config(name: str, values: dict[str, str] | None = None) -> dict:

@@ -1,6 +1,7 @@
 """CAD backends as separate MCP servers: progress keeps a long call alive, the server's cad profile answers the
 plugin's questions, detection and the install flow (no download: the pip runs are replaced)."""
 import json
+import pathlib
 import sys
 from types import SimpleNamespace
 
@@ -152,20 +153,27 @@ def test_install_uses_the_configured_source_and_records_it(data, monkeypatch, tm
     monkeypatch.setitem(STATE.settings, "server_sources", {"inventor": str(src)})
     ran = []
 
-    def fake_run(cmd, log, timeout):
+    def fake_run(cmd, log, timeout, cwd=None):
         ran.append(cmd)
+        assert cwd == installer.server_dir("inventor")
         if "venv" in cmd:
-            py = installer._venv_python("inventor")
+            py = installer._py_in(pathlib.Path(cmd[-1]))
             py.parent.mkdir(parents=True, exist_ok=True)
             py.write_text("")
+        else:
+            assert "--isolated" in cmd and "-I" in cmd
     monkeypatch.setattr(installer, "_run", fake_run)
     monkeypatch.setattr(installer.subprocess, "run",
                         lambda *a, **k: SimpleNamespace(returncode=0, stdout="0.2.0\n", stderr=""))
     assert not installer.server_status("inventor")["installed"]
+    with pytest.raises(installer.InstallError, match="approval prompt"):
+        installer.install("inventor")                      # nothing shown, nothing installed
     notice = installer.install_notice("inventor")
     assert "inventor-forge" in notice and str(src) in notice and "approve" in notice.lower()
     rec = installer.install("inventor")
     assert rec["version"] == "0.2.0" and any(str(src.resolve()) in c for c in ran[-1])
+    first_env = installer._venv_python("inventor")
+    assert first_env.exists()
     st = installer.server_status("inventor")
     assert st["installed"] and st["current"]
     cfg = installer.server_config("inventor", {"job_dir": "C:/jobs/x"})
@@ -174,6 +182,24 @@ def test_install_uses_the_configured_source_and_records_it(data, monkeypatch, tm
     # a different source later (a plugin release moved the pin) shows as an update
     monkeypatch.setitem(STATE.settings, "server_sources", {"inventor": str(tmp_path)})
     assert not installer.server_status("inventor")["current"]
+    # an update that fails part-way leaves the working environment in use
+    installer.install_notice("inventor")
+
+    def failing_run(cmd, log, timeout, cwd=None):
+        if "venv" in cmd:
+            fake_run(cmd, log, timeout, cwd)
+        elif "--no-deps" not in cmd:
+            raise installer.InstallError("dependency download failed")
+    monkeypatch.setattr(installer, "_run", failing_run)
+    with pytest.raises(installer.InstallError):
+        installer.install("inventor")
+    assert installer._venv_python("inventor") == first_env and first_env.exists()
+    assert len([p for p in installer.server_dir("inventor").iterdir() if p.name.startswith("venv-")]) == 1
+
+
+def test_credentials_in_a_source_are_hidden():
+    assert installer.redact("git+https://user:secret@example.com/r.git") == "git+https://***@example.com/r.git"
+    assert installer.redact("C:/src/forge") == "C:/src/forge"
 
 
 def test_unpinned_release_refuses_to_guess(data, monkeypatch):
@@ -205,3 +231,58 @@ def test_install_needs_approval_and_choice_is_remembered(data, monkeypatch):
     assert out["ok"] and "freecad" in out["found"]
     installer.remember("freecad")
     assert installer.chosen() == "freecad"
+
+
+# --------------------------------------------------------------------------- after the code review
+class _Plain:
+    """A server without a cad profile."""
+    initialized = True
+    profile = None
+    server_info = {"name": "plain"}
+    tools = {"macro": {"description": "Do a thing", "annotations": {}},
+             "peek": {"description": "Look", "annotations": {"readOnlyHint": True}}}
+
+
+def test_deleting_calls_ask_first(fake_server, monkeypatch):
+    from hermes_shaperotator.core.workbench import LIVE
+    monkeypatch.setattr(LIVE, "enter", lambda: None)
+    _FakeClient.tools["purge_studies"] = {"_meta": {"cad/deletes": {"if_args": {"confirm": True}}}}
+    try:
+        d = P._pre_tool_call(tool_name="cad_native", args={"tool": "purge_studies", "args": {"keep": ["A"], "confirm": True}})
+        assert d and d["action"] == "approve" and "permanently" in d["message"]
+        assert P._pre_tool_call(tool_name="cad_native", args={"tool": "purge_studies", "args": {"keep": ["A"]}}) is None
+    finally:
+        _FakeClient.tools.pop("purge_studies")
+
+
+def test_unprofiled_server_tools_ask_unless_read_only(monkeypatch):
+    from hermes_shaperotator.core.workbench import LIVE
+    monkeypatch.setattr(LIVE, "enter", lambda: None)
+    monkeypatch.setattr(STATE, "backend", lambda *a: SimpleNamespace(client=_Plain(), ops={}))
+    d = P._pre_tool_call(tool_name="cad_native", args={"tool": "macro", "args": {}})
+    assert d and d["action"] == "approve" and "doesn't describe" in d["message"]
+    assert P._pre_tool_call(tool_name="cad_native", args={"tool": "peek", "args": {}}) is None
+
+
+def test_user_notified_only_for_tools_that_take_it(fake_server):
+    _FakeClient.tools["analyze_stress"] = {"_meta": {"cad/takes_input": True},
+                                           "inputSchema": {"properties": {"user_notified": {}}}}
+    _FakeClient.tools["other_mouse"] = {"_meta": {"cad/takes_input": True}, "inputSchema": {"properties": {}}}
+    try:
+        assert server_profile.accepts("analyze_stress", "user_notified")
+        assert not server_profile.accepts("other_mouse", "user_notified")
+    finally:
+        _FakeClient.tools.pop("analyze_stress")
+        _FakeClient.tools.pop("other_mouse")
+
+
+def test_status_never_starts_a_cad_program(data, monkeypatch):
+    from hermes_shaperotator.core import tools as T
+    started = []
+    fake = SimpleNamespace(client=SimpleNamespace(initialized=False), available=lambda: (True, "ok"),
+                           call=lambda *a, **k: started.append(a) or {})
+    monkeypatch.setattr(STATE, "backend", lambda *a: fake)
+    monkeypatch.setitem(STATE.backends, STATE.backend_name, fake)
+    monkeypatch.setattr(STATE, "backend_chosen", STATE.backend_name)
+    out = json.loads(T.HANDLERS["cad_status"]({}))
+    assert out["ok"] and out["document"] is None and not started

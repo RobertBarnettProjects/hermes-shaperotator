@@ -19,10 +19,11 @@ TAKES_INPUT_FALLBACK = {"analyze_stress": True, "analyze_modes": True, "result_a
                         "study_report": {"if_args": {"only_this_study": True}}}
 
 
-def client(start: bool = False):
-    """The active backend's MCP client, or None (FreeCAD, or a server not started yet when start is False)."""
+def client(start: bool = False, backend=None):
+    """The active (or given) backend's MCP client, or None (FreeCAD, or a server not started yet when start is
+    False)."""
     try:
-        b = STATE.backend()
+        b = backend if backend is not None else STATE.backend()
     except Exception:
         return None
     c = getattr(b, "client", None)
@@ -61,13 +62,51 @@ def declares(start: bool = False) -> bool:
     return bool(getattr(c, "profile", None))
 
 
-def meta(tool: str, start: bool = False) -> dict | None:
-    """The tool's _meta, or None when the server isn't running, doesn't declare a profile, or doesn't list the tool."""
-    tools = _tools(start)
-    if tools is None or tool not in tools or not declares():
-        return None
+def meta(tool: str, start: bool = False, c=None) -> dict | None:
+    """The tool's _meta, or None when the server isn't running, doesn't declare a profile, or doesn't list the tool.
+    c: a specific client (default: the active backend's)"""
+    if c is None:
+        tools = _tools(start)
+        if tools is None or tool not in tools or not declares():
+            return None
+    else:
+        try:
+            tools = c.tools
+        except Exception:
+            return None
+        if tool not in tools or not getattr(c, "profile", None):
+            return None
     m = tools[tool].get("_meta")
     return m if isinstance(m, dict) else {}
+
+
+def _when(v, args: dict | None) -> bool:
+    """A profile flag: true, or {"if_args": {...}} true only for those argument values."""
+    if isinstance(v, dict):
+        a = args or {}
+        return all(a.get(k) == x for k, x in (v.get("if_args") or {}).items())
+    return bool(v)
+
+
+def read_only(tool: str) -> bool:
+    """Does the active server mark this tool read-only (MCP readOnlyHint)? False when it can't say."""
+    tools = _tools(False) or {}
+    return bool(((tools.get(tool) or {}).get("annotations") or {}).get("readOnlyHint", False))
+
+
+def undeclared_change(tool: str) -> bool:
+    """A tool of a server that publishes no profile, and doesn't mark the tool read-only: it may write files or run
+    code the plugin can't see, so the user is asked first."""
+    tools = _tools(True)
+    if tools is None or tool not in tools or declares():
+        return False
+    return not read_only(tool)
+
+
+def deletes(tool: str, args: dict | None = None) -> bool:
+    """Does this call delete something that can't be brought back (the server's cad/deletes)?"""
+    m = meta(tool, start=True)
+    return m is not None and _when(m.get("cad/deletes"), args)
 
 
 # --------------------------------------------------------------------------- questions
@@ -84,11 +123,13 @@ def geometry(tool: str, fallback: set[str] | None = None) -> bool:
 def takes_input(tool: str, args: dict | None = None, start: bool = True) -> bool:
     m = meta(tool, start)
     v = m.get("cad/takes_input") if m is not None else TAKES_INPUT_FALLBACK.get(tool)
-    if isinstance(v, dict):
-        want = v.get("if_args") or {}
-        a = args or {}
-        return all(a.get(k) == x for k, x in want.items())
-    return bool(v)
+    return _when(v, args)
+
+
+def accepts(tool: str, arg: str) -> bool:
+    """Does the tool's input schema have this argument?"""
+    tools = _tools(False) or {}
+    return arg in (((tools.get(tool) or {}).get("inputSchema") or {}).get("properties") or {})
 
 
 def runs_code(tool: str, description: str = "") -> bool:
@@ -102,29 +143,42 @@ def files(tool: str) -> dict[str, list[str]] | None:
     """{"writes", "reads", "names"} declared for the tool, {} when it touches no files, None when undeclared."""
     m = meta(tool, start=True)
     if m is None:
-        return None
+        # an inventor-forge from before the profile still declares its file arguments
+        tools = _tools(False) or {}
+        legacy = ((tools.get(tool) or {}).get("_meta") or {}).get("inventor-forge/files")
+        if not isinstance(legacy, dict):
+            return None
+        m = {"cad/files": legacy}
     f = m.get("cad/files") or m.get("inventor-forge/files") or {}
     return {k: [str(x) for x in f.get(k) or []] for k in ("writes", "reads", "names")}
 
 
-def budget(tool: str, args: dict, default: float) -> float:
-    """How long to wait for the call: the server's cad/budget rule for these arguments, never below default."""
-    m = (meta(tool) or {}).get("cad/budget")
+MAX_WAIT_S = 7 * 24 * 3600.0          # no budget, however a server states it, waits longer than a week
+
+
+def budget(tool: str, args: dict, default: float, c=None) -> float:
+    """How long to wait for the call: the server's cad/budget rule for these arguments, never below default.
+    c: the client the call goes to (default: the active backend's)"""
+    m = (meta(tool, c=c) or {}).get("cad/budget")
     if not isinstance(m, dict):
         return default
-    floor = max(default, float(m.get("floor_s") or FLOOR_S))
-    arg = m.get("timeout_arg")
-    if not arg:
-        return floor
     try:
-        own = float(args.get(arg, m.get("timeout_default")))
-    except (TypeError, ValueError):
-        return floor
-    n = 1
-    for name, fallback in (m.get("repeat_args") or {}).items():
-        v = args.get(name)
-        n = max(n, len(v) if isinstance(v, (list, tuple)) else int(fallback or 1))
-    return max(floor, n * (own + float(m.get("per_item_s", 600))) + float(m.get("extra_s", 300)))
+        floor = max(default, float(m.get("floor_s") or FLOOR_S))
+        arg = m.get("timeout_arg")
+        if not arg:
+            return min(floor, MAX_WAIT_S)
+        try:
+            own = float(args.get(arg, m.get("timeout_default")))
+        except (TypeError, ValueError):
+            return min(floor, MAX_WAIT_S)
+        n = 1
+        for name, fallback in (m.get("repeat_args") or {}).items():
+            v = args.get(name)
+            n = max(n, len(v) if isinstance(v, (list, tuple)) and v else int(fallback or 1))
+        out = max(floor, n * (own + float(m.get("per_item_s", 600))) + float(m.get("extra_s", 300)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return min(out, MAX_WAIT_S) if out == out else default        # NaN: the default
 
 
 def describe(tool: str) -> str:

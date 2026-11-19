@@ -113,7 +113,7 @@ keyboard (the approval prompt says so), run code (approval with the code shown),
 write or read (writes outside the job folder ask first; nothing is guessed), and how long a call may take. While a
 call runs, MCP progress notifications keep it alive past its budget, up to twice it; a silent server still times
 out. A server without a profile works too, with cautious answers to each of these. `tests/test_mcp_backend.py` drives a stand-in
-CAD server this way. More programs (NX first) are planned.
+CAD server this way.
 
 ## Tools (toolset `cad`)
 

@@ -32,7 +32,7 @@ class _McpForge:
         self.client.start()                       # before the budget: it comes from the server's tool list
         if name == "connect":
             self.client.wait_for_pending_calls()
-        wait = server_profile.budget(name, args, self.client.timeout)
+        wait = server_profile.budget(name, args, self.client.timeout, c=self.client)
         meta = self.client.tools.get(name) or {}
         mutating = False if name == "connect" else not (meta.get("annotations") or {}).get("readOnlyHint", False)
         result = self.client.call(name, args, mutating=mutating, timeout=wait)
@@ -100,7 +100,9 @@ class InventorBackend(CadBackend):
             env = dict(s.get("env") or {})
             env.setdefault("INVENTOR_FORGE_VISIBLE", "1" if self.settings.get("inventor_visible", True) else "0")
             client = McpClient(s["command"], env=env, cwd=s.get("cwd"), timeout=float(s.get("timeout", 900)))
-            self._forge = _McpForge(client)
+            with self._lock:                  # a live poll and a tool call must not each make a client
+                if self._forge is None:
+                    self._forge = _McpForge(client)
         return self._forge.client
 
     @property
