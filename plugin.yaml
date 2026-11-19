@@ -37,13 +37,11 @@ provides_hooks:
   - pre_llm_call
   - transform_llm_output
   - on_session_finalize
-python_dependencies:
-  - "pywin32>=306,<312; sys_platform == 'win32'"
 config_schema:
   backend:
     type: str
-    default: "freecad"
-    description: "Active CAD backend: freecad or inventor"
+    default: ""
+    description: "CAD program to use: freecad or inventor. Empty: the agent asks on first use and remembers the answer"
   freecad_path:
     type: str
     default: ""

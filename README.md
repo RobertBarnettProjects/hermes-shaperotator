@@ -33,8 +33,8 @@ figure in its reply that no analysis backs**.
   and keeps the answer for the rest of the chat; drawings, fastener and material suggestions follow it.
 - **Drawings:** sheets to the chat's standard (template, projection angle) with title block and projection symbol on both backends; a QA
   check runs on the sheet and PDF export waits for it to be clean (override once with `/cad force-export`).
-- **Inventor automation:** the Inventor backend is [inventor-forge](https://github.com/RobertBarnettProjects/inventor-forge)
-  (vendored in `backends/inventor/forge`); `cad_native` reaches its 160+ tools (sheet metal and flat patterns,
+- **Inventor automation:** the Inventor backend is [inventor-forge](https://github.com/RobertBarnettProjects/inventor-forge),
+  an MCP server of its own, downloaded on first use once you approve it; `cad_native` reaches its 200+ tools (sheet metal and flat patterns,
   assemblies, interference, BOM, materials, mass properties, section/detail views, Stress Analysis studies, load-case
   sweeps without the mouse once a study exists), including welded round-tube frames on 3D centre lines with a cut
   list (`tube_frame`, real AS/NZS 1163 CHS sizes), named grades the library lacks (`create_material`, e.g. C250L0)
@@ -68,11 +68,21 @@ Requirements:
 | | |
 |---|---|
 | FreeCAD 1.0+ | required for FEA and the default backend. Auto-detected (Windows `%LOCALAPPDATA%\Programs\FreeCAD *`, `Program Files`, macOS app bundle, Linux `freecadcmd`); or set `freecad_path`. Ships Gmsh and CalculiX. |
-| Autodesk Inventor 2024+ | optional, Windows only (`pywin32` is installed with the plugin). |
+| Autodesk Inventor 2024+ | optional, Windows only. Its add-on, inventor-forge, is downloaded on first use: see below. |
+
+**First use.** The first CAD chat finds the CAD programs on the computer and the agent asks which to use; the
+answer is kept. A program that needs an add-on (Inventor needs inventor-forge) gets it through
+`cad_backend(action='install')`: Hermes's approval prompt names the package, its source (a pinned commit of its
+repository) and where it goes. It is installed with pip into its own Python environment under the plugin's data
+folder (`servers/<name>`), so nothing in Hermes's Python changes, and deleting that folder removes it. A plugin
+release that moves the pin offers the update the same way. The known programs are listed in
+`backends/known.json`.
 
 Settings (Desktop: **Capabilities → Plugins → hermes-shaperotator**, or `plugins.entries.hermes-shaperotator.settings` in
-`config.yaml`): `backend` (`freecad`/`inventor`), `freecad_path`, `standard` (optional: fixes the standard for every chat, e.g. `AS1100`, `ISO`, `ASME`, `DIN`,
-`BS8888`, `JIS`, `GB`; leave it empty and the agent asks once per chat), `job_dir`, `inventor_visible`.
+`config.yaml`): `backend` (`freecad`/`inventor`; leave it empty and the agent asks on first use), `freecad_path`, `standard` (optional: fixes the standard for every chat, e.g. `AS1100`, `ISO`, `ASME`, `DIN`,
+`BS8888`, `JIS`, `GB`; leave it empty and the agent asks once per chat), `job_dir`, `inventor_visible`,
+`server_sources` (development: install a backend's server from a local checkout instead of its pinned commit, e.g.
+`{inventor: C:/src/inventor-forge}`).
 
 ## Any CAD program: swap the MCP server
 
@@ -95,7 +105,14 @@ plugins:
 ```
 
 Then `cad_backend backend=my-cad`. Unmapped ops fall back to a server tool of the same name, and
-every server tool is reachable through `cad_native`. `tests/test_mcp_backend.py` drives a stand-in
+every server tool is reachable through `cad_native`.
+
+A server can describe its tools for the plugin with a `cad/*` profile in each tool's `_meta` (inventor-forge's
+`profile.py` defines it): which tools change the shape (the pane refreshes after them), take over the mouse and
+keyboard (the approval prompt says so), run code (approval with the code shown), which arguments name files they
+write or read (writes outside the job folder ask first; nothing is guessed), and how long a call may take. While a
+call runs, MCP progress notifications keep it alive past its budget, up to twice it; a silent server still times
+out. A server without a profile works too, with cautious answers to each of these. `tests/test_mcp_backend.py` drives a stand-in
 CAD server this way. More programs (NX first) are planned.
 
 ## Tools (toolset `cad`)
@@ -146,8 +163,12 @@ reported when an analysis computed one. The footer is append-only, so streaming 
 - **Runs local programs:** starts FreeCAD's Python as a worker process (`freecad_path`), which runs Gmsh
   and CalculiX; on Windows can drive Autodesk Inventor over COM (it may start Inventor).
 - **Arbitrary code (opt-in per call):** `cad_python` executes Python inside FreeCAD/Inventor with your user
-  permissions. It always goes through Hermes's approval prompt (refused when nobody answers). The vendored
-  inventor-forge also contains an `execute_python` tool; `cad_native` refuses it and points to `cad_python`.
+  permissions. It always goes through Hermes's approval prompt (refused when nobody answers). inventor-forge also
+  has an `execute_python` tool; `cad_native` refuses it and points to `cad_python`.
+- **Downloads (opt-in, once per program):** `cad_backend(action='install')` downloads a CAD program's add-on server
+  (inventor-forge from its GitHub repository at the commit pinned in `backends/known.json`, plus pywin32 from PyPI)
+  and installs it with pip into its own environment under the plugin data folder. Always through Hermes's approval
+  prompt, which names what is downloaded and where it goes.
 - **Takes over the mouse and keyboard (opt-in per call):** `cad_native analyze_stress / analyze_modes` drive
   Inventor's Stress Analysis (which has no API) by clicking faces in Inventor's viewport and typing into its
   dialogs for about half a minute. Each call goes through Hermes's approval prompt (refused when nobody
@@ -181,5 +202,5 @@ Tests that need FreeCAD skip when it isn't installed.
 ## Credits
 
 The Inventor backend is [inventor-forge](https://github.com/RobertBarnettProjects/inventor-forge) (MIT, same author),
-vendored in `backends/inventor/forge` (refresh with its `scripts/vendor_into_hermes_shaperotator.py`). FreeCAD, Gmsh
+installed on first use; `scripts/pin_backend.py inventor ../inventor-forge` moves the pin to a pushed commit. FreeCAD, Gmsh
 and CalculiX are separate programs installed by the user. Licence: MIT.
