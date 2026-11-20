@@ -3,6 +3,18 @@
 Describe what a part has to survive; Hermes designs it in your CAD, analyses it, and **flags any engineering
 figure in its reply that no analysis backs**.
 
+![Click a face of the kart in the ShapeRotator pane and ask Hermes about it](docs/click-a-face.gif)
+
+*Click a tube of the go-kart frame in the ShapeRotator pane; `@Face_25` lands in the chat and Hermes answers from the
+model's real geometry (26.9 mm OD, 2.3 mm wall).*
+
+![Hermes → ShapeRotator plugin → MCP → inventor-forge (Autodesk Inventor), FreeCAD, or any CAD MCP server](docs/architecture.png)
+
+ShapeRotator is the workflow (plans, hand-calc checks, the evidence log, drawing QA, the 3D pane). The CAD program
+behind it is swappable: FreeCAD is built in, Autodesk Inventor runs through
+[inventor-forge](https://github.com/RobertBarnettProjects/inventor-forge) (an MCP server installed on first use, with
+your approval), and any other CAD MCP server can be added in config.
+
 - **Parametric CAD** through one toolset: FreeCAD (headless, cross-platform; parts) or Autodesk Inventor (Windows,
   COM; parts, sheet metal, assemblies, drawings). Every feature returns a volume/topology delta, so the agent checks its
   own work against a hand calculation.
@@ -50,9 +62,26 @@ figure in its reply that no analysis backs**.
   design history, artifacts, the evidence log, and drawing / Inventor-result previews. The 3D view meshes models with
   FreeCAD, so it needs FreeCAD installed even when you work in Inventor.
 
-![FreeCAD-backend drawing](docs/freecad-drawing-sample.png)
-![CAD pane in Hermes Desktop](docs/cad-desktop-bracket-fea.jpg)
-![Design sweep with the verification footer](docs/cad-sweep-desktop.jpg)
+![Hand calculation against Inventor's solver on the kart frame: a disagreement it has to explain, then agreement](docs/numbers-check.png)
+
+*The kart frame under a 3 g landing in Inventor. The first model fixed the bearing bores, and the solver's 485 MPa
+peak disagreed with the 140 MPa hand calculation; the agent had to explain the singularity before quoting either.
+With the bearings as pins, deflection agrees within 16 %.*
+
+![Stress map of the kart frame in the ShapeRotator pane, with the loads drawn as arrows](docs/kart-stress-pane.jpg)
+
+*The same load case re-solved with CalculiX, in the pane: stress colours, the 3,530 N driver load and the 588 N
+battery-pack load drawn on the faces they act on, and the supports as green symbols.*
+
+| | |
+|---|---|
+| ![Bracket detail drawing with section A-A and detail B](docs/bracket-detail-drawing.jpg) | ![Go-kart general arrangement with parts list and balloons](docs/kart-ga-drawing.jpg) |
+| A detail drawing from one sentence: section A-A, detail B, hole notes, AS 1100, QA clean before the PDF | The kart's general arrangement: four views, 23-item parts list, balloons |
+
+| | |
+|---|---|
+| ![FreeCAD-backend drawing](docs/freecad-drawing-sample.png) | ![Design sweep with the verification footer](docs/cad-sweep-desktop.jpg) |
+| The same drawing workflow on the FreeCAD backend | A design sweep, with the verification footer on the reply |
 
 ## Install
 
