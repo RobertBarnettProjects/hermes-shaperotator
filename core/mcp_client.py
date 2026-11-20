@@ -333,7 +333,7 @@ class McpClient:
         """Call a tool; returns its JSON result as a dict (text that isn't JSON comes back as {"text": ...})."""
         self.start()
         if mutating is None:
-            mutating = not self.tools.get(name, {}).get("annotations", {}).get("readOnlyHint", False)
+            mutating = not ((self.tools.get(name) or {}).get("annotations") or {}).get("readOnlyHint", False)
         if self.uncertain and mutating:
             raise McpError("Previous tools/call timed out, mutation outcome uncertain. Call connect to re-sync before further mutations.")
         r = self.request("tools/call", {"name": name, "arguments": args or {}}, timeout=timeout, mutating=mutating)

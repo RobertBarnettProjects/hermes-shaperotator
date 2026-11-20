@@ -126,3 +126,26 @@ for line in sys.stdin:
         assert client.uncertain
     finally:
         client.close()
+
+
+def test_a_tool_listed_with_null_annotations_can_be_called():
+    script = '''
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    m = msg["method"]
+    if m == "tools/list":
+        res = {"tools": [{"name": "box", "inputSchema": {"type": "object"}, "annotations": None}]}
+    elif m == "tools/call":
+        res = {"content": [{"type": "text", "text": json.dumps({"made": True})}], "isError": False}
+    else:
+        res = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": res}), flush=True)
+'''
+    client = client_for(script, timeout=10)
+    try:
+        assert client.call("box", {}) == {"made": True}
+    finally:
+        client.close()

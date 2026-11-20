@@ -52,7 +52,7 @@ def safe(fn: Callable[..., str]) -> Callable[..., str]:
             if type(e).__name__ == "StandardError":
                 return _err(str(e))
             return _err(f"bad arguments: {e}")
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError) as e:
             return _err(f"bad arguments: {e}")
         except Exception as e:  # last resort: never raise into the agent loop
             return _err(f"{type(e).__name__}: {e}")
