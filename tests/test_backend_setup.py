@@ -237,7 +237,7 @@ def test_install_needs_approval_and_choice_is_remembered(data, monkeypatch):
     assert installer.chosen() == "freecad"
 
 
-# --------------------------------------------------------------------------- after the code review
+# --------------------------------------------------------------------------- servers without a profile
 class _Plain:
     """A server without a cad profile."""
     initialized = True

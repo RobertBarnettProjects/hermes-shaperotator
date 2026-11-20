@@ -1,5 +1,4 @@
-"""The three items from the plugin-catalog review of 635c8720: confined write paths, a minimal child environment,
-and a safety-factor pattern that can't backtrack badly."""
+"""Confined write paths, a minimal child environment, and figure patterns that can't backtrack badly."""
 import os
 import sys
 import time
@@ -138,7 +137,7 @@ def test_safety_factor_still_found(text, value):
     assert [c.value for c in verify.extract(text) if c.quantity == "safety_factor"] == [value]
 
 
-# --------------------------------------------------------------------------- review 4 (Fable 5.2, Sol 6.1)
+# --------------------------------------------------------------------------- pattern timing, paths, environment
 @pytest.mark.parametrize("text", ["1" * 20000, "sag" * 6666, "deflect" * 2857, "1" * 10000 + " " * 10000,
                                   "9" * 10000, "1." * 10000])
 def test_no_pattern_backtracks_on_long_runs(text):

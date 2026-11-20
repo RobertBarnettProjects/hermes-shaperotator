@@ -85,10 +85,6 @@ the bearings modelled as pins, the deflections agree within 16 %.*
 *The same load case re-solved with CalculiX and shown in the pane: stress colours, the 3,530 N driver load and the
 588 N battery-pack load on the faces they act on, and the supports in green.*
 
-![Design sweep with the verification footer](docs/cad-sweep-desktop.jpg)
-
-*A design sweep, with the verification footer on the reply.*
-
 ## Records and deliverables
 
 - **Design history (`cad_history`).** Plan runs and Inventor analyses record versions V1, V2, … automatically, and
