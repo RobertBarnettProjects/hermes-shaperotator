@@ -55,3 +55,38 @@ def test_outside_files_resolves_what_the_call_names(job, tmp_path):
     out = paths.outside_files("cad_document", {"action": "export", "path": str(tmp_path / "x.step")})
     assert out == [str((tmp_path / "x.step").resolve())]
     assert paths.outside_files("cad_document", {"action": "export", "path": str(job / "y.step")}) == []
+
+
+def test_a_refusal_never_reaches_another_server_tools_prompt(job, tmp_path):
+    """Every server tool goes through cad_native: what one of them was refused must not be asked about (and, once
+    approved, allowed) for a different one."""
+    outside = str(tmp_path / "lib" / "a.ipt")
+    refusal = json.dumps({"ok": False, "error": "won't save\n" + writescope.NEEDS_MARK + " " + json.dumps([outside])})
+    seen = []
+
+    def handler(args, **kw):
+        seen.append(writescope.current()["files"])
+        return refusal if args["tool"] == "save_document" else json.dumps({"ok": True})
+
+    run = writescope.scoped("cad_native", handler)
+    save = {"tool": "save_document", "args": {"path": str(job / "asm.iam")}}
+    plugin._pre_tool_call(tool_name="cad_native", args=save)
+    run(save)
+    other = {"tool": "list_faces", "args": {}}
+    assert plugin._pre_tool_call(tool_name="cad_native", args=other) is None        # no prompt for the unrelated call
+    run(other)
+    assert seen == [[], []]
+    # the same server tool with its arguments normalised differently still gets the prompt, as before
+    again = {"tool": "save_document", "args": {"path": str(job / "asm.iam"), "list_only": False}}
+    d = plugin._pre_tool_call(tool_name="cad_native", args=again)
+    assert d and d["action"] == "approve" and outside in d["message"]
+    run(again)
+    assert seen[2] == [outside]
+
+
+def test_fallback_key_is_the_tool_and_what_it_does():
+    key = writescope.call_key
+    assert writescope._tool(key("cad_native", {"tool": "save_document", "args": {}})) == "cad_native\0save_document"
+    assert writescope._tool(key("cad_document", {"action": "save"})) == "cad_document\0save"
+    assert writescope._tool(key("cad_status", {})) == "cad_status"
+    assert writescope._tool(key("cad_python", "print(1)")) == "cad_python"

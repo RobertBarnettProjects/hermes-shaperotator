@@ -17,14 +17,25 @@ _CURRENT: contextvars.ContextVar = contextvars.ContextVar("shaperotator_write_sc
 _LOCK = threading.Lock()
 _STAGED: dict[str, list[str]] = {}        # call key -> outside files its approval prompt named
 _NEEDED: dict[str, list[str]] = {}        # call key -> files the server refused last time
-# the same, by tool name: the hook and the handler may see the arguments normalised differently, and the approval
-# prompt for a tool immediately precedes its handler, so the tool's latest entry is the fallback
+# the same, by tool (for cad_native, with the server tool it calls; for the others, with their action): the hook and
+# the handler may see the arguments normalised differently, and the approval prompt for a tool immediately precedes
+# its handler, so that tool's latest entry is the fallback. Never by the plugin tool's name alone: every server tool
+# goes through cad_native, and a refusal of one must not put its paths into the prompt (and scope) of another.
 _STAGED_TOOL: dict[str, list[str]] = {}
 _NEEDED_TOOL: dict[str, list[str]] = {}
 
 
 def _tool(key: str) -> str:
-    return key.split("\0", 1)[0]
+    name, _, raw = key.partition("\0")
+    try:
+        args = json.loads(raw) if raw else None
+    except ValueError:
+        args = None
+    if isinstance(args, dict):
+        sub = args.get("tool") if name == "cad_native" else args.get("action")
+        if isinstance(sub, str) and sub:
+            return f"{name}\0{sub}"
+    return name
 
 
 def call_key(tool_name: str, args: Any) -> str:
@@ -94,7 +105,7 @@ def scoped(tool_name: str, handler):
         key = call_key(tool_name, args)
         with _LOCK:
             files = _STAGED.pop(key, None)
-            fallback = _STAGED_TOOL.pop(tool_name, [])
+            fallback = _STAGED_TOOL.pop(_tool(key), [])
             files = fallback if files is None else files
         sc = default_scope()
         sc["files"] = files
@@ -106,10 +117,10 @@ def scoped(tool_name: str, handler):
         got = parse_needed(out)
         with _LOCK:
             if got:
-                _NEEDED[key] = _NEEDED_TOOL[tool_name] = got
+                _NEEDED[key] = _NEEDED_TOOL[_tool(key)] = got
             else:
                 _NEEDED.pop(key, None)
-                _NEEDED_TOOL.pop(tool_name, None)
+                _NEEDED_TOOL.pop(_tool(key), None)
         return out
     run.__name__ = getattr(handler, "__name__", tool_name)
     run.__doc__ = getattr(handler, "__doc__", None)
